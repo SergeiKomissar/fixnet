@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# логи, если появится режим --log
+*.log
+
+# временные файлы
+*.tmp
+*.bak
