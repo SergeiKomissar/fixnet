@@ -760,7 +760,7 @@ UL_M=$(to_mbps "$UBPS")
 
 # Нейросети (Фаза 7): при активном VPN и не --no-ai — компактная проверка доступности
 # OpenAI/Claude через TLS-handshake. Без VPN в обычном выводе НЕ шумим (см. контракт).
-AI_RESULTS=""; AI_RUN=0; AI_TOTAL=0; AI_OK=0; AI_BLOCKED=0; AI_UNCONF=0; AI_UNREACH=0; AI_BAD=0; AI_SLOW=0; AI_OK_NAMES=""; AI_BAD_NAMES=""; AI_UNCONF_NAMES=""
+AI_RESULTS=""; AI_RUN=0; AI_TOTAL=0; AI_OK=0; AI_BLOCKED=0; AI_UNCONF=0; AI_UNREACH=0; AI_BAD=0; AI_SLOW=0; AI_OK_NAMES=""; AI_BAD_NAMES=""; AI_UNCONF_NAMES=""; AI_SLOW_NAMES=""
 if [ "$VPN_ACTIVE" -eq 1 ] && [ "$WANT_AI" -eq 1 ] && command -v curl >/dev/null 2>&1; then
     NI_STEPS=$((NI_STEPS+1)); ni_step "проверяю доступность нейросетей"
     AI_MODE="default"        # в основном выводе всегда базовый набор (OpenAI+Claude)
@@ -841,7 +841,7 @@ if [ "$MAIN_OK" -eq 1 ]; then
     # Хвост про качество канала (общий для всех веток). Пусто при green.
     QSUFFIX=""
     case "$QLEVEL" in
-        yellow) QSUFFIX=", но канал нестабильный — видеосвязь и большие загрузки лучше отложить" ;;
+        yellow) QSUFFIX=", но канал нестабильный — видеосвязь, удалённый рабочий стол и VPN-работа могут дёргаться" ;;
         red)    QSUFFIX=", но канал плохой — видеосвязь и большие загрузки лучше отложить" ;;
     esac
     # Фаза 7: если при активном VPN проверяли AI — итог про то, ради чего VPN включён.
@@ -1043,7 +1043,7 @@ if [ "$WANT_GEO" -eq 1 ]; then
             # утверждаем. Намёк «если ожидал другую — сервер не тот» нейтральный.
             VLOC=""; [ -n "$COUNTRY" ] && VLOC=" — $(country_name "$COUNTRY")${CITY:+, $(city_name "$CITY")}"
             echo -e "  VPN-выход:          ${G}активен${N}${VLOC:+ ${D}${VLOC}${N}}"
-            echo -e "  ${D}Проверка VPN:       если ожидал другую страну — выбран не тот сервер${N}"
+            echo -e "  ${D}Проверка VPN:       если ожидал другую страну — проверь выбранный сервер VPN${N}"
         else
             echo -e "  VPN-выход:          ${D}не обнаружен${N}"
         fi
@@ -1775,14 +1775,14 @@ ai_check() {
 # blocked ИЛИ unreachable (TLS прошёл ≠ можно пользоваться).
 ai_summarize() {
     AI_TOTAL=0; AI_OK=0; AI_BLOCKED=0; AI_UNCONF=0; AI_UNREACH=0; AI_SLOW=0
-    AI_OK_NAMES=""; AI_BAD_NAMES=""; AI_UNCONF_NAMES=""
+    AI_OK_NAMES=""; AI_BAD_NAMES=""; AI_UNCONF_NAMES=""; AI_SLOW_NAMES=""
     local name host net code ms dns verdict grade reason err
     while IFS=$'\t' read -r name host net code ms dns verdict grade reason err; do
         [ -z "$name" ] && continue
         AI_TOTAL=$((AI_TOTAL+1))
         case "$verdict" in
             network_ok)  AI_OK=$((AI_OK+1)); AI_OK_NAMES="${AI_OK_NAMES}${AI_OK_NAMES:+, }${name}"
-                         { [ "$grade" = "slow" ] || [ "$grade" = "degraded" ]; } && AI_SLOW=$((AI_SLOW+1)) ;;
+                         { [ "$grade" = "slow" ] || [ "$grade" = "degraded" ]; } && { AI_SLOW=$((AI_SLOW+1)); AI_SLOW_NAMES="${AI_SLOW_NAMES}${AI_SLOW_NAMES:+, }${name}"; } ;;
             unconfirmed) AI_UNCONF=$((AI_UNCONF+1)); AI_UNCONF_NAMES="${AI_UNCONF_NAMES}${AI_UNCONF_NAMES:+, }${name}" ;;
             blocked)     AI_BLOCKED=$((AI_BLOCKED+1)); AI_BAD_NAMES="${AI_BAD_NAMES}${AI_BAD_NAMES:+, }${name}" ;;
             *)           AI_UNREACH=$((AI_UNREACH+1)); AI_BAD_NAMES="${AI_BAD_NAMES}${AI_BAD_NAMES:+, }${name}" ;;
@@ -1860,15 +1860,19 @@ ai_report() {
     ai_render "$AI_RESULTS" detail
     ai_summarize
     echo
+    # Хвост про медленные домены (network_ok с grade slow/degraded) — чтобы итог учитывал
+    # оранжевую строку, а не игнорировал её (правка по ревью).
+    local slow_tail=""
+    [ "${AI_SLOW:-0}" -gt 0 ] && slow_tail="; ${Y}${AI_SLOW_NAMES} отвечает медленно${N}"
     if [ "$vpn" -eq 0 ]; then
         echo -e "  ${D}Вывод: проверка напрямую, без VPN; если домены отклоняют — включи VPN и повтори netinfo --ai${N}"
     elif [ "$AI_BAD" -eq 0 ] && [ "$AI_UNCONF" -eq 0 ]; then
-        echo -e "  Вывод: ${G}VPN включён; AI API-домены отвечают без признаков регионального отказа.${N}"
+        echo -e "  Вывод: ${G}VPN включён; AI API-домены отвечают без признаков регионального отказа${N}${slow_tail}."
     elif [ "$AI_BAD" -eq 0 ]; then
         if [ "$AI_OK" -eq 0 ]; then
             echo -e "  Вывод: ${Y}домены отвечают 403 «нужен ключ» — без ключа доступ/блок не подтвердить.${N}"
         else
-            echo -e "  Вывод: ${G}отвечают: ${AI_OK_NAMES}${N}${Y}; без ключа не подтверждены: ${AI_UNCONF_NAMES}.${N}"
+            echo -e "  Вывод: ${G}отвечают: ${AI_OK_NAMES}${N}${slow_tail}${Y}; без ключа не подтверждены: ${AI_UNCONF_NAMES}.${N}"
         fi
     elif [ "$AI_UNREACH" -eq "$AI_TOTAL" ]; then
         echo -e "  ${Y}Все AI-домены одновременно дали таймаут.${N} ${D}Похоже на временный сбой маршрута/VPN,${N}"
