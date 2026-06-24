@@ -372,10 +372,14 @@ dns_problem(NXDOMAIN) / tcp_blocked(IP:закрытый порт) / auth_require
 ИНВАРИАНТЫ: кнопка/клавиша НЕ несут своей логики диагностики (только ввод URL → why_report)
 — единственный источник правды по слоям остаётся `why_report`. Кнопка БЕЗ sudo (повтор: это
 read-only-проба). Имя файла `why.command` — латиницей (надёжнее кириллицы в путях/Spotlight).
-ИКОНКА пока не навешена (функция важнее косметики); по желанию — тем же путём, что
-netinfo/fixnet (make-*-icon.py → iconutil → setIcon + `SetFile -a C` + killall Finder, см.
-низ файла); ОБНОВЛЯТЬ иконизированную кнопку только `cat new > ~/Desktop/why.command`.
-Регрессия вживую: буфер с URL → Enter → 206 ✅; пустой буфер → ручной ввод → 404 ✅; bash -n ✅.
+ИКОНКА: СДЕЛАНА (фирменная, семейство fixnet/netinfo). `make-why-icon.py` (PIL) → тёмный
+squircle + зелёные дуги Wi-Fi + жёлтый «?» (вместо молнии/лупы), знак рисуется шрифтом
+SF Rounded с тёмным гало (отделяет от дуг) → `why_1024.png` → `iconutil` → `why.icns`.
+Навешена тем же путём, что netinfo/fixnet: `NSWorkspace setIcon:forFile:` (osascript) +
+`SetFile -a C` (флаг кастомной иконки) + `SetFile -a E` (спрятать «.command») + killall
+Finder. ⚠ ОБНОВЛЯТЬ иконизированную кнопку ТОЛЬКО `cat new > ~/Desktop/why.command` (cp
+снесёт resource fork и флаги C/E). Регрессия вживую: буфер с URL → Enter → 206 ✅; пустой
+буфер → ручной ввод → 404 ✅; bash -n ✅; иконка навешена (ResourceFork+FinderInfo на файле) ✅.
 
 ## Фаза 12 (сделано): человеческий язык + `--explain`/`?` (перед `--why URL`)
 
