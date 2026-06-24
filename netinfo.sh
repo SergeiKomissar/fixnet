@@ -1720,8 +1720,10 @@ ai_classify() {  # $1=http_code  $2=lowercased_body  → "verdict\treason"
         *"country, region, or territory not supported"*|*"region, or territory not supported"*) printf 'blocked\tregion_not_supported\n'; return ;;
         *"not available in your country"*|*"not supported in your country"*) printf 'blocked\tnot_available_in_country\n'; return ;;
         *"request not allowed"*) printf 'blocked\trequest_not_allowed\n'; return ;;   # Anthropic регион-отказ (в рабочем регионе он 405)
-        *"available in certain regions"*|*"available in select regions"*|*"available in certain countries"*|*"app unavailable in region"*|*"not available in your region"*)
+        *"available in certain regions"*|*"available in select regions"*|*"available in certain countries"*|*"app unavailable in region"*|*"not available in your region"*|*"not yet available in your country"*|*"isn't available in your country"*)
             printf 'blocked\tregion_restricted\n'; return ;;   # регион-заглушка с HTTP 200 (Claude «App unavailable», и т.п.)
+        *"не поддерживается в вашей стране"*|*"не поддерживается в вашем регионе"*|*"недоступно в вашей стране"*|*"недоступен в вашей стране"*|*"недоступно в вашем регионе"*)
+            printf 'blocked\tregion_restricted\n'; return ;;   # русская регион-заглушка (server-rendered; SPA рисует JS — не ловится)
         *"just a moment"*|*"checking your browser"*|*"verify you are human"*|*turnstile*|*"enable javascript and cookies"*)
             printf 'blocked\tcloudflare_challenge\n'; return ;;   # JS-ПРОВЕРКА: настоящий браузер её проходит, curl — нет (cf-mitigated: challenge ловим из заголовка)
         *"error code: 1020"*|*"error 1020"*|*"you have been blocked"*|*"sorry, you have been blocked"*|*"attention required"*|*"access denied"*)
@@ -2086,7 +2088,7 @@ why_report() {
     awk "BEGIN{exit !(($tapp+0)>0)}" && tls_ok=1
 
     # --- Классификация по слою ---
-    local wclass="" wreason="-"
+    local wclass="" wreason="-" is_spa=0
     if [ "$dns_ok" -eq 0 ] && [ "$doh_ok" -eq 0 ]; then
         if [ "$base_ok" -eq 0 ]; then wclass="local_network"; else wclass="dns_problem"; fi
     elif [ "$dns_ok" -eq 0 ] && [ "$doh_ok" -eq 1 ]; then
@@ -2113,6 +2115,11 @@ why_report() {
                 LC_ALL=C curl -sS -L -D "$hf" -r 0-16383 -o "$bf2" --connect-timeout 5 --max-time 8 "$url" 2>/dev/null
                 lb=$(head -c 16384 "$bf2" 2>/dev/null | tr 'A-Z' 'a-z')
                 cfm=$(tr 'A-Z' 'a-z' < "$hf" 2>/dev/null | grep 'cf-mitigated' | head -1)
+                # SPA-оболочка? (Google/Angular/React/Next/Vue). Тогда контент и ограничения
+                # рисуются в браузере через JS — в сыром HTML их нет, и «отвечает нормально» врёт.
+                case "$lb" in
+                    *af_initdatacallback*|*wiz_global_data*|*__next_data__*|*ng-version*|*"<app-root"*|*data-reactroot*|*"id=\"__nuxt\""*) is_spa=1 ;;
+                esac
                 rm -f "$bf2" "$hf" 2>/dev/null ;;
         esac
         cls=$(ai_classify "$code" "$lb"); v=$(printf '%s' "$cls" | cut -f1); wreason=$(printf '%s' "$cls" | cut -f2)
@@ -2173,8 +2180,14 @@ why_report() {
     [ "$vpn" -eq 0 ] && vpnhint="Включи VPN и повтори: netinfo --why ${url}" || vpnhint="Попробуй другой сервер VPN и повтори"
     case "$wclass" in
         ok)
-            echo -e "  Вывод: ${G}Ресурс отвечает нормально (HTTP ${code}).${N}"
-            echo -e "  ${D}Если в браузере всё равно не открывается — дело в самом приложении/расширении/кэше, не в сети.${N}" ;;
+            echo -e "  Вывод: ${G}Сервер ответил нормально (HTTP ${code}).${N}"
+            if [ "${is_spa:-0}" -eq 1 ]; then
+                echo -e "  ${D}Но это веб-приложение (страница-оболочка): контент и ограничения (регион/доступ) рисуются${N}"
+                echo -e "  ${D}в браузере через JavaScript — этим способом их не видно.${N}"
+                echo -e "  ${D}Если в браузере показана ошибка или «недоступно в стране» — это уровень приложения/региона, не сети.${N}"
+            else
+                echo -e "  ${D}Если в браузере всё равно не открывается — дело в самом приложении/расширении/кэше, не в сети.${N}"
+            fi ;;
         local_network)
             echo -e "  Вывод: ${R}Проблема не в этом ресурсе — не прошла даже контрольная проверка интернета.${N}"
             echo -e "  ${D}Сначала почини сеть: запусти netinfo (общий осмотр) или войди в Wi-Fi-портал.${N}" ;;
