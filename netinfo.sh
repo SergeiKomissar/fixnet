@@ -2036,12 +2036,24 @@ why_report() {
     echo -e "  Ресурс:             ${C}${url}${N}"
     echo -e "  Хост:               ${C}${host}${N}"
     [ "$scheme" = "http" ] && echo -e "  ${Y}Схема: HTTP — соединение не шифруется.${N}"
-    # VPN — только как контекст (route на utun); без geo, чтобы не тормозить.
+    # VPN — контекст (route на utun). + ОТКУДА стучимся (страна выхода): для 403/451
+    # это принципиально — отказ из РФ/КНР и из ЕС значит разное (правка по запросу).
     local extdev vpn=0
     extdev=$(route -n get "$PROBE_IP1" 2>/dev/null | awk '/interface:/{print $2}')
     case "$extdev" in utun*) vpn=1 ;; esac
     [ "$vpn" -eq 1 ] && echo -e "  VPN:                ${G}активен${N}" \
-                     || echo -e "  VPN:                ${D}не активен (проверка напрямую)${N}"
+                     || echo -e "  VPN:                ${D}не активен — стучимся из своей страны${N}"
+    local gjson gip gcity gcc gcn
+    nl_spin_start "определяю страну выхода"
+    gjson=$(curl -s --connect-timeout 3 --max-time 6 "https://ipinfo.io/json" 2>/dev/null)
+    nl_spin_stop
+    gip=$(clean "$(json_get "$gjson" ip)"); gcity=$(clean "$(json_get "$gjson" city)")
+    gcc=$(clean "$(json_get "$gjson" country)"); gcn=$(country_name "$gcc"); [ -z "$gcn" ] && gcn="$gcc"
+    if [ -n "$gcc" ]; then
+        echo -e "  Откуда стучимся:    ${C}${gcn}${gcity:+, $gcity}${N}${D}  ·  IP ${gip}${N}"
+    else
+        echo -e "  Откуда стучимся:    ${D}страну выхода определить не удалось${N}"
+    fi
 
     nl_spin_start "проверяю ${host}"
     # Контроль «сеть вообще жива» — отделяет «у меня сеть лежит» от «ресурс не открывается».
