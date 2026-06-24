@@ -1722,7 +1722,7 @@ ai_classify() {  # $1=http_code  $2=lowercased_body  → "verdict\treason"
         *"request not allowed"*) printf 'blocked\trequest_not_allowed\n'; return ;;   # Anthropic регион-отказ (в рабочем регионе он 405)
         *"available in certain regions"*|*"available in select regions"*|*"available in certain countries"*|*"app unavailable in region"*|*"not available in your region"*|*"not yet available in your country"*|*"isn't available in your country"*)
             printf 'blocked\tregion_restricted\n'; return ;;   # регион-заглушка с HTTP 200 (Claude «App unavailable», и т.п.)
-        *"не поддерживается в вашей стране"*|*"не поддерживается в вашем регионе"*|*"недоступно в вашей стране"*|*"недоступен в вашей стране"*|*"недоступно в вашем регионе"*)
+        *"не поддерживается в вашей стране"*|*"не поддерживается в вашем регионе"*|*"недоступно в вашей стране"*|*"недоступен в вашей стране"*|*"недоступно в вашем регионе"*|*"недоступен в вашем регионе"*|*"доступ ограничен в вашем регионе"*)
             printf 'blocked\tregion_restricted\n'; return ;;   # русская регион-заглушка (server-rendered; SPA рисует JS — не ловится)
         *"just a moment"*|*"checking your browser"*|*"verify you are human"*|*turnstile*|*"enable javascript and cookies"*)
             printf 'blocked\tcloudflare_challenge\n'; return ;;   # JS-ПРОВЕРКА: настоящий браузер её проходит, curl — нет (cf-mitigated: challenge ловим из заголовка)
@@ -2118,7 +2118,7 @@ why_report() {
                 # SPA-оболочка? (Google/Angular/React/Next/Vue). Тогда контент и ограничения
                 # рисуются в браузере через JS — в сыром HTML их нет, и «отвечает нормально» врёт.
                 case "$lb" in
-                    *af_initdatacallback*|*wiz_global_data*|*__next_data__*|*ng-version*|*"<app-root"*|*data-reactroot*|*"id=\"__nuxt\""*) is_spa=1 ;;
+                    *af_initdatacallback*|*wiz_global_data*|*__next_data__*|*ng-version*|*"<app-root"*|*data-reactroot*|*"id=\"__nuxt\""*|*"id=\"root\"></"*|*"id=\"app\"></"*) is_spa=1 ;;
                 esac
                 rm -f "$bf2" "$hf" 2>/dev/null ;;
         esac
@@ -2152,6 +2152,8 @@ why_report() {
                 *)   wclass="ok" ;;
             esac
         fi
+        # SPA-оболочка поверх «ok» → отдельный класс app_shell (итоговый экран рисует JS — не видим).
+        [ "$wclass" = "ok" ] && [ "$is_spa" -eq 1 ] && wclass="app_shell"
     fi
     rm -f "$bf" 2>/dev/null
 
@@ -2181,13 +2183,15 @@ why_report() {
     case "$wclass" in
         ok)
             echo -e "  Вывод: ${G}Сервер ответил нормально (HTTP ${code}).${N}"
-            if [ "${is_spa:-0}" -eq 1 ]; then
-                echo -e "  ${D}Но это веб-приложение (страница-оболочка): контент и ограничения (регион/доступ) рисуются${N}"
-                echo -e "  ${D}в браузере через JavaScript — этим способом их не видно.${N}"
-                echo -e "  ${D}Если в браузере показана ошибка или «недоступно в стране» — это уровень приложения/региона, не сети.${N}"
-            else
-                echo -e "  ${D}Если в браузере всё равно не открывается — дело в самом приложении/расширении/кэше, не в сети.${N}"
-            fi ;;
+            echo -e "  ${D}Если в браузере всё равно не открывается — дело в самом приложении/расширении/кэше, не в сети.${N}" ;;
+        app_shell)
+            # ДОКАЗАНО только: это оболочка SPA, итог рисует JS. НЕ называем это блокировкой —
+            # её в сыром ответе не видно (знаем из браузера, но проба не доказала). «Предел проверки».
+            echo -e "  Вывод: ${Y}Сетевые слои прошли: сайт отдал HTML-оболочку приложения (HTTP ${code}).${N}"
+            echo -e "  ${D}Итоговое содержимое формирует браузер через JavaScript — эта проверка не видит сообщения,${N}"
+            echo -e "  ${D}которое появляется только после запуска приложения.${N}"
+            echo -e "  ${D}Если в браузере ресурс пишет «не поддерживается в вашей стране» — это ограничение сервиса/${N}"
+            echo -e "  ${D}региона/аккаунта, а не поломка сети до сайта. Тогда смени страну VPN/аккаунт и повтори.${N}" ;;
         local_network)
             echo -e "  Вывод: ${R}Проблема не в этом ресурсе — не прошла даже контрольная проверка интернета.${N}"
             echo -e "  ${D}Сначала почини сеть: запусти netinfo (общий осмотр) или войди в Wi-Fi-портал.${N}" ;;
@@ -2270,7 +2274,7 @@ why_report() {
         auth_required|http_forbidden|html_instead_of_file)
             echo -e "  ${D}Важно: проверка идёт без cookies, аккаунта и JavaScript — в залогиненном браузере результат может отличаться.${N}" ;;
     esac
-    echo -e "  ${D}Проверка СЛОЯ отказа (read-only; файл не качаем, HTML читаем кратко — до 16 КБ — на маркеры блокировки).${N}"
+    echo -e "  ${D}Проверка СЛОЯ отказа (read-only; файл не качаем, HTML читаем кратко на маркеры; JS-приложения не выполняем).${N}"
     echo
 }
 
