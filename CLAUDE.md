@@ -367,15 +367,24 @@ CURL ≠ БРАУЗЕР (важный инвариант, правка по жи
 БЕЗ cookie, сессии и JS. Поэтому страницы за входом / SPA-маршруты (напр. `claude.ai/new`)
 и сайты за Cloudflare отдают пробе **403 «Just a moment…»** (JS-проверка Cloudflare), хотя в
 залогиненном браузере с cookie+JS всё ОТКРЫВАЕТСЯ. РАНЬШЕ это давало ложное «антибот — смени
-сервер». Лечение: отделяем Cloudflare-ЧЕЛЛЕНДЖ от ЖЁСТКОГО блока. ai_classify: «just a moment» /
-«checking your browser» / «enable javascript and cookies to continue» → `cloudflare_challenge`
-(браузер проходит); «attention required»→cloudflare_antibot, «error code: 1020»→cloudflare_1020,
-«you have been blocked»→blocked_page, «access denied»→access_denied (жёсткий блок IP). В --why
-для `cloudflare_challenge`: «это автоматическая проверка Cloudflare, НЕ отказ; настоящий браузер
-её проходит, наш запрос — нет; скорее всего в браузере открывается; смени сервер ТОЛЬКО если и
-в браузере не открывается». В --ai cloudflare_challenge → жёлтый «Cloudflare-проверка (браузер
-проходит)», не красный антибот. НЕ добавляли браузерный User-Agent в пробу: проверено вживую —
-на JS-челлендж он НЕ влияет (это не UA-блок), а маскировать пробу под браузер не хотим.
+сервер». Лечение: отделяем Cloudflare-ЧЕЛЛЕНДЖ от ЖЁСТКОГО блока. ai_classify (по ТЕЛУ):
+`cloudflare_challenge` ← «just a moment» / «checking your browser» / «verify you are human» /
+«turnstile» / «enable javascript and cookies» (браузер проходит); `cloudflare_block` ←
+«error 1020» / «you have been blocked» / «sorry, you have been blocked» / «attention required» /
+«access denied» (жёсткий блок CDN/IP). ОТДЕЛЬНЫЙ КЛАСС --why `browser_challenge` (НЕ http_forbidden —
+это не отказ): «сетевые слои прошли, но CDN отдал проверку браузера; проверка без cookies/аккаунта/
+JS — curl её не проходит; если в браузере открыто — чинить нечего; смени сервер ТОЛЬКО если и
+в браузере не открывается». `cloudflare_block` → http_forbidden/blockpage с «смени сервер/IP».
+В --ai: challenge → жёлтый «нужна браузерная проверка», block → красный «антибот/CDN отказал».
+
+ЗАГОЛОВОК `cf-mitigated` (challenge|block) — авторитетнее тела, НО берём его ОТДЕЛЬНО (`curl -D`
+в файл заголовков), а в ai_classify подаём ЧИСТОЕ ТЕЛО. 🔴 ГРАБЛИ: сначала включили заголовки в
+скан (`curl -i`) — в них есть `access-control-allow-credentials`/`www-authenticate`, что сматчило
+маркер `*credential*`/`*authenticat*` → ложный «нужен ключ» на httpbin/403. Урок: заголовки в
+тело-скан НЕ мешать; cf-mitigated проверять прицельно (`*challenge*`/`*block*` в строке заголовка).
+ДИСКЛЕЙМЕР «проверка без cookies/аккаунта/JS» показываем ТОЛЬКО при auth_required/http_forbidden/
+html_instead_of_file (и в самом browser_challenge), иначе шумит. НЕ добавляли браузерный User-Agent:
+проверено вживую — на JS-челлендж он НЕ влияет (не UA-блок), а маскировать пробу под браузер не хотим.
 
 🔴 ГРАБЛИ: IP-литерал в host (1.1.1.1) — dig/DoH «не резолвят» (IP не резолвится в
 принципе) → ошибочно dns_problem. Лечение: regex IPv4 → dns_ok=1, DNS-слой пропускаем.

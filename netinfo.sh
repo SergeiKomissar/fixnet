@@ -1722,12 +1722,10 @@ ai_classify() {  # $1=http_code  $2=lowercased_body  → "verdict\treason"
         *"request not allowed"*) printf 'blocked\trequest_not_allowed\n'; return ;;   # Anthropic регион-отказ (в рабочем регионе он 405)
         *"available in certain regions"*|*"available in select regions"*|*"available in certain countries"*|*"app unavailable in region"*|*"not available in your region"*)
             printf 'blocked\tregion_restricted\n'; return ;;   # регион-заглушка с HTTP 200 (Claude «App unavailable», и т.п.)
-        *"just a moment"*|*"checking your browser"*|*"enable javascript and cookies to continue"*)
-            printf 'blocked\tcloudflare_challenge\n'; return ;;   # JS-ПРОВЕРКА: настоящий браузер её проходит, curl — нет
-        *"attention required"*) printf 'blocked\tcloudflare_antibot\n'; return ;;
-        *"error code: 1020"*) printf 'blocked\tcloudflare_1020\n'; return ;;
-        *"you have been blocked"*) printf 'blocked\tblocked_page\n'; return ;;
-        *"access denied"*) printf 'blocked\taccess_denied\n'; return ;;
+        *"just a moment"*|*"checking your browser"*|*"verify you are human"*|*turnstile*|*"enable javascript and cookies"*)
+            printf 'blocked\tcloudflare_challenge\n'; return ;;   # JS-ПРОВЕРКА: настоящий браузер её проходит, curl — нет (cf-mitigated: challenge ловим из заголовка)
+        *"error code: 1020"*|*"error 1020"*|*"you have been blocked"*|*"sorry, you have been blocked"*|*"attention required"*|*"access denied"*)
+            printf 'blocked\tcloudflare_block\n'; return ;;       # ЖЁСТКИЙ блок CDN/IP/политики — IP может быть в чёрном списке
     esac
     if [ "$1" = "403" ]; then
         case "$2" in
@@ -1832,9 +1830,9 @@ ai_render() {  # $1 = TSV, $2 = "detail"|""
                 col=$R; act="смени страну VPN"
                 case "$reason" in
                     cloudflare_challenge)
-                        label="🟡 Cloudflare-проверка (браузер проходит, проба — нет)"; act="в браузере, скорее всего, открыто" ;;
-                    cloudflare_antibot|cloudflare_1020|blocked_page|access_denied)
-                        label="🔴 антибот-защита (IP в чёрном списке)"; act="смени сервер/IP (лучше не дата-центр)" ;;
+                        col=$Y; label="🟡 нужна браузерная проверка — curl не проходит JS/cookie-челлендж"; act="в браузере, скорее всего, открыто" ;;
+                    cloudflare_block|cloudflare_antibot|cloudflare_1020|blocked_page|access_denied)
+                        label="🔴 антибот/CDN отказал — возможно, IP VPN в чёрном списке"; act="смени сервер/IP (лучше не дата-центр)" ;;
                     http_403_forbidden) label="🔴 доступ запрещён (403)"; act="смени сервер/страну VPN" ;;
                     http_451)           label="🔴 заблокирован (451)" ;;
                     *)                  label="🔴 региональный отказ" ;;
@@ -2102,19 +2100,36 @@ why_report() {
         # (≤16 КБ, НЕ файл — у нас был лишь 1 байт от range 0-0): регион-блок часто отдаётся
         # страницей-заглушкой с HTTP 200 (Claude «App unavailable», OpenAI и т.п.). Файлы
         # (pdf/zip/бинарь) НЕ дочитываем — для них пустое тело = ok по коду.
-        local lb="" cls v
+        local lb="" cls v cfm=""
         case "$ctype" in
             text/html*|application/json*|*+json*|text/plain*|*xml*)
-                local bf2; bf2=$(mktemp "$(nl_tmp_dir)/netinfo-why.XXXXXX" 2>/dev/null) || bf2="$(nl_tmp_dir)/netinfo-why.b.$$"
-                LC_ALL=C curl -sS -L -r 0-16383 -o "$bf2" --connect-timeout 5 --max-time 8 "$url" 2>/dev/null
-                lb=$(head -c 16384 "$bf2" 2>/dev/null | tr 'A-Z' 'a-z'); rm -f "$bf2" 2>/dev/null ;;
+                # Тело сканируем ЧИСТО (без заголовков): в заголовках есть слова credential/
+                # authenticate (CORS, WWW-Authenticate) → дали бы ложный «нужен ключ». Заголовки
+                # дампим ОТДЕЛЬНО (-D) и берём из них только авторитетный cf-mitigated. -r 0-16383:
+                # тело не качаем целиком; файлы (pdf/zip/бинарь) сюда не попадают (не тот ctype).
+                local bf2 hf
+                bf2=$(mktemp "$(nl_tmp_dir)/netinfo-why.XXXXXX" 2>/dev/null) || bf2="$(nl_tmp_dir)/netinfo-why.b.$$"
+                hf=$(mktemp "$(nl_tmp_dir)/netinfo-why.XXXXXX" 2>/dev/null) || hf="$(nl_tmp_dir)/netinfo-why.h.$$"
+                LC_ALL=C curl -sS -L -D "$hf" -r 0-16383 -o "$bf2" --connect-timeout 5 --max-time 8 "$url" 2>/dev/null
+                lb=$(head -c 16384 "$bf2" 2>/dev/null | tr 'A-Z' 'a-z')
+                cfm=$(tr 'A-Z' 'a-z' < "$hf" 2>/dev/null | grep 'cf-mitigated' | head -1)
+                rm -f "$bf2" "$hf" 2>/dev/null ;;
         esac
         cls=$(ai_classify "$code" "$lb"); v=$(printf '%s' "$cls" | cut -f1); wreason=$(printf '%s' "$cls" | cut -f2)
+        # cf-mitigated — авторитетный заголовок Cloudflare (надёжнее тела): challenge vs block.
+        case "$cfm" in
+            *challenge*) v="blocked"; wreason="cloudflare_challenge" ;;
+            *block*)     v="blocked"; wreason="cloudflare_block" ;;
+        esac
         if   [ "$v" = "blocked" ]; then
-            case "$code" in
-                2*) wclass="blockpage" ;;       # сетевые слои прошли, но тело — заглушка блокировки
-                *)  wclass="http_forbidden" ;;  # 403/451 и т.п.
-            esac
+            if [ "$wreason" = "cloudflare_challenge" ]; then
+                wclass="browser_challenge"      # это НЕ отказ: проверка браузера, которую curl не проходит
+            else
+                case "$code" in
+                    2*) wclass="blockpage" ;;       # сетевые слои прошли, но тело — заглушка блокировки
+                    *)  wclass="http_forbidden" ;;  # 403/451 и т.п.
+                esac
+            fi
         elif [ "$v" = "unconfirmed" ]; then wclass="auth_required"
         else
             case "$code" in
@@ -2178,20 +2193,16 @@ why_report() {
             echo -e "  Вывод: ${Y}До сервера дозвонились, но защищённое соединение не встаёт.${N}"
             echo -e "  ${D}Возможны фильтрация TLS, корпоративный прокси, сбой сертификата или несовместимость.${N}"
             echo -e "  ${D}${vpnhint}.${N}" ;;
+        browser_challenge)
+            echo -e "  Вывод: ${Y}Сетевые слои прошли, но сервер/CDN отдал проверку браузера Cloudflare (HTTP ${code}) — это НЕ отказ.${N}"
+            echo -e "  ${D}Эта проверка не использует cookies, аккаунт и JavaScript — curl такую проверку не проходит.${N}"
+            echo -e "  ${D}Если сайт открывается в браузере — сетевой доступ есть, чинить нечего.${N}"
+            echo -e "  ${D}Если в браузере тоже не открывается — попробуй другой VPN-сервер/IP.${N}" ;;
         http_forbidden)
-            if [ "$wreason" = "cloudflare_challenge" ]; then
-                echo -e "  Вывод: ${Y}Сервер показал автоматическую проверку Cloudflare (HTTP ${code}, «Just a moment…») — это НЕ отказ.${N}"
-            else
-                echo -e "  Вывод: ${R}До сервера достучались, но он отклонил доступ (HTTP ${code}).${N}"
-            fi
+            echo -e "  Вывод: ${R}До сервера достучались, но он отклонил доступ (HTTP ${code}).${N}"
             case "$wreason" in
-                cloudflare_challenge)
-                    # JS-проверка Cloudflare: реальный браузер (cookie+JS) её проходит, наш «голый» curl — нет.
-                    echo -e "  ${D}Её проходит настоящий браузер (с cookie и JavaScript); наш проверочный запрос — нет.${N}"
-                    echo -e "  ${D}Скорее всего, в твоём браузере страница ОТКРЫВАЕТСЯ (тем более если ты залогинен) — это не доказывает блокировку.${N}"
-                    echo -e "  ${D}Если и в браузере не открывается — тогда возможно дело в IP/сервере VPN: смени сервер.${N}" ;;
-                cloudflare_antibot|cloudflare_1020|blocked_page|access_denied)
-                    echo -e "  ${D}Похоже на антибот-защиту / жёсткий блок (IP сервера/VPN в чёрном списке). Смени сервер/IP (лучше не дата-центр).${N}" ;;
+                cloudflare_block)
+                    echo -e "  ${D}Похоже на антибот / жёсткий блок CDN (IP сервера/VPN в чёрном списке). Смени сервер/IP (лучше не дата-центр).${N}" ;;
                 http_403_forbidden)
                     # «голый» 403 без явного маркера — НЕ утверждаем регион. Перечисляем причины.
                     echo -e "  ${D}Сервер/CDN отклонил доступ. Возможные причины: авторизация, политика сайта, IP VPN, регион или антибот-защита.${N}"
@@ -2206,10 +2217,7 @@ why_report() {
             echo -e "  Вывод: ${R}Сетевые слои прошли, но сервер прислал СТРАНИЦУ-ЗАГЛУШКУ (HTTP ${code}), а не сам ресурс.${N}"
             local loc=""; [ -n "$gcc" ] && loc=" из «${gcn}»"
             case "$wreason" in
-                cloudflare_challenge)
-                    echo -e "  ${D}Это автоматическая проверка Cloudflare («Just a moment…») — её проходит настоящий браузер, а не наш запрос.${N}"
-                    echo -e "  ${D}Скорее всего, в браузере страница открывается. Если нет — смени сервер/IP VPN.${N}" ;;
-                cloudflare_antibot|cloudflare_1020|blocked_page|access_denied)
+                cloudflare_block)
                     echo -e "  ${D}Похоже на антибот-/CDN-защиту (IP сервера/VPN в чёрном списке). Смени сервер/IP (лучше не дата-центр).${N}" ;;
                 region_restricted|unsupported_country|unsupported_country_region_territory|region_not_supported|location_not_supported|user_location_not_supported|not_available_in_country)
                     # ЯВНЫЙ региональный маркер («доступен в некоторых странах» / «country not supported») — можно сильнее.
@@ -2244,6 +2252,10 @@ why_report() {
         slow_or_timeout)
             echo -e "  Вывод: ${Y}Соединение установилось, но ответ не пришёл за отведённое время (таймаут).${N}"
             echo -e "  ${D}Маршрут/канал перегружен или сервер не отвечает. Повтори позже. ${vpnhint}.${N}" ;;
+    esac
+    case "$wclass" in
+        auth_required|http_forbidden|html_instead_of_file)
+            echo -e "  ${D}Важно: проверка идёт без cookies, аккаунта и JavaScript — в залогиненном браузере результат может отличаться.${N}" ;;
     esac
     echo -e "  ${D}Проверка СЛОЯ отказа (read-only; файл не качаем, HTML читаем кратко — до 16 КБ — на маркеры блокировки).${N}"
     echo

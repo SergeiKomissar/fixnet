@@ -12,8 +12,12 @@
 - Новый маркер `region_restricted`; дисклеймер честно про «HTML читаем до 16 КБ на маркеры».
 - CURL ≠ БРАУЗЕР: страницы за входом/Cloudflare (напр. claude.ai/new) отдают пробе 403
   «Just a moment…», хотя в залогиненном браузере открываются. Отделили Cloudflare-ЧЕЛЛЕНДЖ
-  (`cloudflare_challenge`, браузер проходит — НЕ «смени сервер») от жёсткого блока (1020/
-  «you have been blocked» — IP плохой). Формулировки в --why и --ai дифференцированы.
+  (`cloudflare_challenge`, браузер проходит — НЕ «смени сервер») от жёсткого блока
+  (`cloudflare_block`: 1020/«you have been blocked»/«access denied» — IP плохой).
+  Отдельный класс --why `browser_challenge`; в --ai challenge жёлтый, block красный.
+- Расширены маркеры (turnstile, verify you are human, …). Заголовок `cf-mitigated`
+  берётся отдельно (`curl -D`), а не в тело-скан: иначе CORS/auth-заголовки давали ложный
+  «нужен ключ». Дисклеймер «без cookies/JS» — только для 401/403/login/HTML-вместо-файла.
 
 ## Фаза 13.2 — доступ к `--why` без Терминала
 - Кнопка `~/Desktop/why.command` (канон `why.command`): берёт ссылку из буфера обмена
