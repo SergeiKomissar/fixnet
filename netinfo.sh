@@ -1722,7 +1722,9 @@ ai_classify() {  # $1=http_code  $2=lowercased_body  → "verdict\treason"
         *"request not allowed"*) printf 'blocked\trequest_not_allowed\n'; return ;;   # Anthropic регион-отказ (в рабочем регионе он 405)
         *"available in certain regions"*|*"available in select regions"*|*"available in certain countries"*|*"app unavailable in region"*|*"not available in your region"*)
             printf 'blocked\tregion_restricted\n'; return ;;   # регион-заглушка с HTTP 200 (Claude «App unavailable», и т.п.)
-        *"just a moment"*|*"attention required"*|*"checking your browser"*) printf 'blocked\tcloudflare_antibot\n'; return ;;
+        *"just a moment"*|*"checking your browser"*|*"enable javascript and cookies to continue"*)
+            printf 'blocked\tcloudflare_challenge\n'; return ;;   # JS-ПРОВЕРКА: настоящий браузер её проходит, curl — нет
+        *"attention required"*) printf 'blocked\tcloudflare_antibot\n'; return ;;
         *"error code: 1020"*) printf 'blocked\tcloudflare_1020\n'; return ;;
         *"you have been blocked"*) printf 'blocked\tblocked_page\n'; return ;;
         *"access denied"*) printf 'blocked\taccess_denied\n'; return ;;
@@ -1829,6 +1831,8 @@ ai_render() {  # $1 = TSV, $2 = "detail"|""
             blocked)
                 col=$R; act="смени страну VPN"
                 case "$reason" in
+                    cloudflare_challenge)
+                        label="🟡 Cloudflare-проверка (браузер проходит, проба — нет)"; act="в браузере, скорее всего, открыто" ;;
                     cloudflare_antibot|cloudflare_1020|blocked_page|access_denied)
                         label="🔴 антибот-защита (IP в чёрном списке)"; act="смени сервер/IP (лучше не дата-центр)" ;;
                     http_403_forbidden) label="🔴 доступ запрещён (403)"; act="смени сервер/страну VPN" ;;
@@ -2175,10 +2179,19 @@ why_report() {
             echo -e "  ${D}Возможны фильтрация TLS, корпоративный прокси, сбой сертификата или несовместимость.${N}"
             echo -e "  ${D}${vpnhint}.${N}" ;;
         http_forbidden)
-            echo -e "  Вывод: ${R}До сервера достучались, но он отклонил доступ (HTTP ${code}).${N}"
+            if [ "$wreason" = "cloudflare_challenge" ]; then
+                echo -e "  Вывод: ${Y}Сервер показал автоматическую проверку Cloudflare (HTTP ${code}, «Just a moment…») — это НЕ отказ.${N}"
+            else
+                echo -e "  Вывод: ${R}До сервера достучались, но он отклонил доступ (HTTP ${code}).${N}"
+            fi
             case "$wreason" in
+                cloudflare_challenge)
+                    # JS-проверка Cloudflare: реальный браузер (cookie+JS) её проходит, наш «голый» curl — нет.
+                    echo -e "  ${D}Её проходит настоящий браузер (с cookie и JavaScript); наш проверочный запрос — нет.${N}"
+                    echo -e "  ${D}Скорее всего, в твоём браузере страница ОТКРЫВАЕТСЯ (тем более если ты залогинен) — это не доказывает блокировку.${N}"
+                    echo -e "  ${D}Если и в браузере не открывается — тогда возможно дело в IP/сервере VPN: смени сервер.${N}" ;;
                 cloudflare_antibot|cloudflare_1020|blocked_page|access_denied)
-                    echo -e "  ${D}Похоже на антибот-защиту (IP сервера/VPN в чёрном списке). Смени сервер/IP (лучше не дата-центр).${N}" ;;
+                    echo -e "  ${D}Похоже на антибот-защиту / жёсткий блок (IP сервера/VPN в чёрном списке). Смени сервер/IP (лучше не дата-центр).${N}" ;;
                 http_403_forbidden)
                     # «голый» 403 без явного маркера — НЕ утверждаем регион. Перечисляем причины.
                     echo -e "  ${D}Сервер/CDN отклонил доступ. Возможные причины: авторизация, политика сайта, IP VPN, регион или антибот-защита.${N}"
@@ -2193,6 +2206,9 @@ why_report() {
             echo -e "  Вывод: ${R}Сетевые слои прошли, но сервер прислал СТРАНИЦУ-ЗАГЛУШКУ (HTTP ${code}), а не сам ресурс.${N}"
             local loc=""; [ -n "$gcc" ] && loc=" из «${gcn}»"
             case "$wreason" in
+                cloudflare_challenge)
+                    echo -e "  ${D}Это автоматическая проверка Cloudflare («Just a moment…») — её проходит настоящий браузер, а не наш запрос.${N}"
+                    echo -e "  ${D}Скорее всего, в браузере страница открывается. Если нет — смени сервер/IP VPN.${N}" ;;
                 cloudflare_antibot|cloudflare_1020|blocked_page|access_denied)
                     echo -e "  ${D}Похоже на антибот-/CDN-защиту (IP сервера/VPN в чёрном списке). Смени сервер/IP (лучше не дата-центр).${N}" ;;
                 region_restricted|unsupported_country|unsupported_country_region_territory|region_not_supported|location_not_supported|user_location_not_supported|not_available_in_country)

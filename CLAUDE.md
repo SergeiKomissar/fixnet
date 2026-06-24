@@ -363,6 +363,20 @@ in your region»). При v=blocked И код 2xx → wclass=blockpage (а не 
 `claude.com/app-unavailable-in-region` — это тест РАСПОЗНАВАНИЯ заглушки (URL отдаёт её всем,
 даже из рабочей страны), НЕ доказательство «Claude недоступен из страны X».
 
+CURL ≠ БРАУЗЕР (важный инвариант, правка по живому ложному плюсу). `--why` стучится curl'ом —
+БЕЗ cookie, сессии и JS. Поэтому страницы за входом / SPA-маршруты (напр. `claude.ai/new`)
+и сайты за Cloudflare отдают пробе **403 «Just a moment…»** (JS-проверка Cloudflare), хотя в
+залогиненном браузере с cookie+JS всё ОТКРЫВАЕТСЯ. РАНЬШЕ это давало ложное «антибот — смени
+сервер». Лечение: отделяем Cloudflare-ЧЕЛЛЕНДЖ от ЖЁСТКОГО блока. ai_classify: «just a moment» /
+«checking your browser» / «enable javascript and cookies to continue» → `cloudflare_challenge`
+(браузер проходит); «attention required»→cloudflare_antibot, «error code: 1020»→cloudflare_1020,
+«you have been blocked»→blocked_page, «access denied»→access_denied (жёсткий блок IP). В --why
+для `cloudflare_challenge`: «это автоматическая проверка Cloudflare, НЕ отказ; настоящий браузер
+её проходит, наш запрос — нет; скорее всего в браузере открывается; смени сервер ТОЛЬКО если и
+в браузере не открывается». В --ai cloudflare_challenge → жёлтый «Cloudflare-проверка (браузер
+проходит)», не красный антибот. НЕ добавляли браузерный User-Agent в пробу: проверено вживую —
+на JS-челлендж он НЕ влияет (это не UA-блок), а маскировать пробу под браузер не хотим.
+
 🔴 ГРАБЛИ: IP-литерал в host (1.1.1.1) — dig/DoH «не резолвят» (IP не резолвится в
 принципе) → ошибочно dns_problem. Лечение: regex IPv4 → dns_ok=1, DNS-слой пропускаем.
 
