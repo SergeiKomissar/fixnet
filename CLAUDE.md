@@ -382,6 +382,10 @@ JS — curl её не проходит; если в браузере откры�
 скан (`curl -i`) — в них есть `access-control-allow-credentials`/`www-authenticate`, что сматчило
 маркер `*credential*`/`*authenticat*` → ложный «нужен ключ» на httpbin/403. Урок: заголовки в
 тело-скан НЕ мешать; cf-mitigated проверять прицельно (`*challenge*`/`*block*` в строке заголовка).
+🔒 ИНВАРИАНТ --why (НЕ нарушать): НЕ смешивать headers и body в одном marker-scan. ТЕЛО →
+классификатор маркеров (регион / login page / blockpage / challenge text); ЗАГОЛОВКИ → парсить
+ТОЛЬКО точечно по известным именам (например cf-mitigated). Заголовки содержат credential/
+authenticate/authorization — общий скан тела по ним даст ложный auth_required.
 ДИСКЛЕЙМЕР «проверка без cookies/аккаунта/JS» показываем ТОЛЬКО при auth_required/http_forbidden/
 html_instead_of_file (и в самом browser_challenge), иначе шумит. НЕ добавляли браузерный User-Agent:
 проверено вживую — на JS-челлендж он НЕ влияет (не UA-блок), а маскировать пробу под браузер не хотим.
