@@ -2194,12 +2194,21 @@ why_report() {
             local loc=""; [ -n "$gcc" ] && loc=" из «${gcn}»"
             case "$wreason" in
                 cloudflare_antibot|cloudflare_1020|blocked_page|access_denied)
-                    echo -e "  ${D}Похоже на антибот-защиту (IP сервера/VPN в чёрном списке). Смени сервер/IP (лучше не дата-центр).${N}" ;;
-                *)  echo -e "  ${D}Похоже на РЕГИОНАЛЬНУЮ блокировку — ресурс открывается не из всех стран.${N}"
+                    echo -e "  ${D}Похоже на антибот-/CDN-защиту (IP сервера/VPN в чёрном списке). Смени сервер/IP (лучше не дата-центр).${N}" ;;
+                region_restricted|unsupported_country|unsupported_country_region_territory|region_not_supported|location_not_supported|user_location_not_supported|not_available_in_country)
+                    # ЯВНЫЙ региональный маркер («доступен в некоторых странах» / «country not supported») — можно сильнее.
+                    echo -e "  ${D}Похоже на региональное ограничение: сервис доступен только в некоторых странах.${N}"
                     if [ "$vpn" -eq 1 ]; then
                         echo -e "  ${D}Ты сейчас выходишь${loc} через VPN — смени СТРАНУ VPN и повтори.${N}"
                     else
                         echo -e "  ${D}Ты сейчас выходишь${loc} (VPN выключен) — включи VPN или смени страну и повтори.${N}"
+                    fi ;;
+                *)  # причина точно не доказана (policy/compliance/age-gate/прочее) — честно «регион ИЛИ политика».
+                    echo -e "  ${D}Похоже на региональное или политическое ограничение доступа — ресурс открывается не из всех стран/IP.${N}"
+                    if [ "$vpn" -eq 1 ]; then
+                        echo -e "  ${D}Попробуй сменить страну/сервер VPN${loc:+ (сейчас${loc})} и повтори.${N}"
+                    else
+                        echo -e "  ${D}Попробуй включить VPN или сменить страну${loc:+ (сейчас${loc})} и повтори.${N}"
                     fi ;;
             esac ;;
         auth_required)
