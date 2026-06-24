@@ -1853,6 +1853,8 @@ ai_classify() {  # $1=http_code  $2=lowercased_body  → "verdict\treason"
         *"country, region, or territory not supported"*|*"region, or territory not supported"*) printf 'blocked\tregion_not_supported\n'; return ;;
         *"not available in your country"*|*"not supported in your country"*) printf 'blocked\tnot_available_in_country\n'; return ;;
         *"request not allowed"*) printf 'blocked\trequest_not_allowed\n'; return ;;   # Anthropic регион-отказ (в рабочем регионе он 405)
+        *"available in certain regions"*|*"available in select regions"*|*"available in certain countries"*|*"app unavailable in region"*|*"not available in your region"*)
+            printf 'blocked\tregion_restricted\n'; return ;;   # регион-заглушка с HTTP 200 (Claude «App unavailable», и т.п.)
         *"just a moment"*|*"attention required"*|*"checking your browser"*) printf 'blocked\tcloudflare_antibot\n'; return ;;
         *"error code: 1020"*) printf 'blocked\tcloudflare_1020\n'; return ;;
         *"you have been blocked"*) printf 'blocked\tblocked_page\n'; return ;;
@@ -2225,11 +2227,23 @@ why_report() {
         elif [ "$tls_ok" -eq 0 ]; then wclass="tls_blocked"
         else wclass="slow_or_timeout"; fi
     else
-        # HTTP-ответ есть → код+тело. Переиспользуем ai_classify (регион/antibot/needs_key/451).
-        local lb cls v
-        lb=$(head -c 8192 "$bf" 2>/dev/null | tr 'A-Z' 'a-z')
+        # HTTP-ответ есть → код+тело. Для HTML/JSON ДОЧИТЫВАЕМ ограниченный кусок тела
+        # (≤16 КБ, НЕ файл — у нас был лишь 1 байт от range 0-0): регион-блок часто отдаётся
+        # страницей-заглушкой с HTTP 200 (Claude «App unavailable», OpenAI и т.п.). Файлы
+        # (pdf/zip/бинарь) НЕ дочитываем — для них пустое тело = ok по коду.
+        local lb="" cls v
+        case "$ctype" in
+            text/html*|application/json*|*+json*|text/plain*|*xml*)
+                local bf2; bf2=$(mktemp "$(nl_tmp_dir)/netinfo-why.XXXXXX" 2>/dev/null) || bf2="$(nl_tmp_dir)/netinfo-why.b.$$"
+                LC_ALL=C curl -sS -L -r 0-16383 -o "$bf2" --connect-timeout 5 --max-time 8 "$url" 2>/dev/null
+                lb=$(head -c 16384 "$bf2" 2>/dev/null | tr 'A-Z' 'a-z'); rm -f "$bf2" 2>/dev/null ;;
+        esac
         cls=$(ai_classify "$code" "$lb"); v=$(printf '%s' "$cls" | cut -f1); wreason=$(printf '%s' "$cls" | cut -f2)
-        if   [ "$v" = "blocked" ]; then wclass="http_forbidden"
+        if   [ "$v" = "blocked" ]; then
+            case "$code" in
+                2*) wclass="blockpage" ;;       # сетевые слои прошли, но тело — заглушка блокировки
+                *)  wclass="http_forbidden" ;;  # 403/451 и т.п.
+            esac
         elif [ "$v" = "unconfirmed" ]; then wclass="auth_required"
         else
             case "$code" in
@@ -2261,6 +2275,7 @@ why_report() {
         if [ -n "$code" ] && [ "$code" != "000" ]; then
             echo -e "     Ответ сервера:     ${C}HTTP ${code}${N}"
             [ -n "$ctype" ] && echo -e "     Тип ответа:        ${D}${ctype}${N}"
+            [ "$wclass" = "blockpage" ] && echo -e "     Содержимое:        ${R}страница-заглушка, не сам ресурс${N}"
         else
             echo -e "     Ответ сервера:     ${R}не получен${N}"
         fi
@@ -2307,6 +2322,19 @@ why_report() {
                 *)  # явный РЕГИОНАЛЬНЫЙ маркер (unsupported_country / location is not supported / request not allowed)
                     echo -e "  ${D}Похоже на отказ по региону/политике (сервис не поддерживает этот регион). Смени страну VPN и повтори.${N}" ;;
             esac ;;
+        blockpage)
+            echo -e "  Вывод: ${R}Сетевые слои прошли, но сервер прислал СТРАНИЦУ-ЗАГЛУШКУ (HTTP ${code}), а не сам ресурс.${N}"
+            local loc=""; [ -n "$gcc" ] && loc=" из «${gcn}»"
+            case "$wreason" in
+                cloudflare_antibot|cloudflare_1020|blocked_page|access_denied)
+                    echo -e "  ${D}Похоже на антибот-защиту (IP сервера/VPN в чёрном списке). Смени сервер/IP (лучше не дата-центр).${N}" ;;
+                *)  echo -e "  ${D}Похоже на РЕГИОНАЛЬНУЮ блокировку — ресурс открывается не из всех стран.${N}"
+                    if [ "$vpn" -eq 1 ]; then
+                        echo -e "  ${D}Ты сейчас выходишь${loc} через VPN — смени СТРАНУ VPN и повтори.${N}"
+                    else
+                        echo -e "  ${D}Ты сейчас выходишь${loc} (VPN выключен) — включи VPN или смени страну и повтори.${N}"
+                    fi ;;
+            esac ;;
         auth_required)
             echo -e "  Вывод: ${Y}Ресурс жив, но требует вход или ключ (HTTP ${code}).${N}"
             echo -e "  ${D}Это не блокировка — нужна авторизация, cookie или прямая ссылка (не страница входа).${N}" ;;
@@ -2325,7 +2353,7 @@ why_report() {
             echo -e "  Вывод: ${Y}Соединение установилось, но ответ не пришёл за отведённое время (таймаут).${N}"
             echo -e "  ${D}Маршрут/канал перегружен или сервер не отвечает. Повтори позже. ${vpnhint}.${N}" ;;
     esac
-    echo -e "  ${D}Это проверка СЛОЯ отказа (read-only, 1 байт). Не проверка причины блокировки, аккаунта или содержимого.${N}"
+    echo -e "  ${D}Проверка СЛОЯ отказа (read-only; файл не качаем, HTML читаем кратко — до 16 КБ — на маркеры блокировки).${N}"
     echo
 }
 

@@ -338,9 +338,23 @@ utun, без geo). Тело — `head -c 8192` ТОЛЬКО для маркер�
 tmp с префиксом `netinfo-why.*` (cleanup чистит и его).
 
 КЛАССЫ: local_network / dns_problem / dns_doh_only / tcp_blocked / tls_blocked /
-http_forbidden(reason: регион|antibot|forbidden) / auth_required(401|needs_key) /
-html_instead_of_file / not_found(404) / rate_limited(429) / server_error(5xx) /
-redirect_loop(3xx после -L) / slow_or_timeout / ok.
+http_forbidden(reason: регион|antibot|forbidden) / blockpage(блок-заглушка при 2xx) /
+auth_required(401|needs_key) / html_instead_of_file / not_found(404) / rate_limited(429) /
+server_error(5xx) / redirect_loop(3xx после -L) / slow_or_timeout / ok.
+
+BLOCKPAGE (правка по живому РФ-кейсу, важно): региональный блок часто отдаётся СТРАНИЦЕЙ-
+ЗАГЛУШКОЙ с HTTP 200 + text/html (Claude `app-unavailable-in-region`: «App unavailable —
+Claude is only available in certain regions»), а НЕ кодом 403/451. range 0-0 (1 байт) этого
+не видит → говорили «отвечает нормально». Лечение: для `text/html`/json/xml/plain ДОЧИТЫВАЕМ
+до 16 КБ тела (вторым curl `-r 0-16383`, ТОЛЬКО HTML/текст — файлы pdf/zip/бинарь НЕ трогаем,
+им пустое тело = ok по коду) → `ai_classify` ловит регион-маркеры даже при 200. Новый маркер
+`region_restricted` («available in certain regions», «app unavailable in region», «not available
+in your region»). При v=blocked И код 2xx → wclass=blockpage (а не http_forbidden): в «Проверки»
+строка «Содержимое: страница-заглушка», в «Вывод» — «сетевые слои прошли, но прислал заглушку»
++ РЕГИОН и СТРАНА ВЫХОДА («выходишь из «Россия» (VPN выключен) — включи VPN»). Дисклеймер честно:
+«файл не качаем, HTML читаем кратко (до 16 КБ) на маркеры блокировки» (НЕ «1 байт»). ОСТАТОЧНЫЙ
+риск: блок-страница с НЕизвестной фразой проскочит как ok (маркеры пополняемы); ложный плюс на
+обычной странице, случайно содержащей фразу-маркер, — возможен, но маркеры специфичны.
 
 🔴 ГРАБЛИ: IP-литерал в host (1.1.1.1) — dig/DoH «не резолвят» (IP не резолвится в
 принципе) → ошибочно dns_problem. Лечение: regex IPv4 → dns_ok=1, DNS-слой пропускаем.
