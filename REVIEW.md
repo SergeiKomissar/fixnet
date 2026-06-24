@@ -1054,6 +1054,54 @@ render_verdict() {
 }
 
 # Технический срез (--tech / клавиша t). Только печать — без новых замеров.
+# Протоколы активных VPN — ЧЕСТНО, только то, что ОС отдаёт. На macOS все туннели = utun
+# (имя интерфейса протокол НЕ выдаёт; по MTU НЕ гадаем). Источник: scutil --nc list (у
+# подключённых в кавычках часто есть протокол, напр. «(OpenVPN)») + факт клиента из ps для
+# app-based NE-VPN, которых в scutil нет (ExpressVPN). read-only.
+vpn_protocols() {
+    local line name proto out=""
+    while IFS= read -r line; do
+        case "$line" in
+            *"(Connected)"*)
+                name=$(printf '%s' "$line" | sed -E 's/.*"([^"]*)".*/\1/')
+                proto=""
+                case "$line $name" in
+                    *[Tt]ailscale*|*[Ww]ire[Gg]uard*) proto="WireGuard" ;;
+                    *[Oo]pen[Vv][Pp][Nn]*)            proto="OpenVPN" ;;
+                    *[Ll]ightway*)                    proto="Lightway" ;;
+                    *IKEv2*|*ikev2*)                  proto="IKEv2" ;;
+                    *IPSec*|*IPsec*|*ipsec*)          proto="IPSec" ;;
+                    *L2TP*|*l2tp*)                    proto="L2TP" ;;
+                esac
+                out="${out}${out:+; }${name}"
+                case "$name" in *"$proto"*) ;; *) [ -n "$proto" ] && out="${out} — ${proto}" ;; esac ;;
+        esac
+    done <<EOF
+$(scutil --nc list 2>/dev/null)
+EOF
+    # app-based клиенты, которых нет в scutil (их NE не регистрируется как NC-сервис).
+    local procs; procs=$(ps -axo comm 2>/dev/null)
+    case "$procs" in
+        *ExpressVPN*) case "$out" in *[Ee]xpress*) ;; *) out="${out}${out:+; }ExpressVPN (клиент активен; протокол выбирается в приложении)" ;; esac ;;
+    esac
+    printf '%s' "$out"
+}
+
+# Похож ли ORG выхода на ХОСТИНГ/дата-центр — эвристика ПО НАЗВАНИЮ (без платной базы).
+# Список известных хостингов НЕПОЛНЫЙ → формулировка «похоже/не похоже», не вердикт.
+org_is_datacenter() {
+    local o; o=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+    case "$o" in
+        *digitalocean*|*hetzner*|*ovh*|*m247*|*edis*|*gigahost*|*leaseweb*|*vultr*|*linode*|*choopa*|\
+        *contabo*|*scaleway*|*datacamp*|*packethub*|*"constant company"*|*g-core*|*gcore*|*"ip volume"*|\
+        *colocation*|*"data center"*|*datacenter*|*hosting*|*colocrossing*|*amazon*|*aws*|*"google llc"*|\
+        *microsoft*|*azure*|*oracle*|*quadranet*|*frantech*|*buyvm*|*hostroyale*|*xtom*|*zenlayer*|\
+        *worldstream*|*serverius*|*"limestone networks"*|*hostwinds*|*"private layer"*|*" ix "*)
+            return 0 ;;
+    esac
+    return 1
+}
+
 render_tech() {
     render_verdict
     echo -e "${D}Замер: ${STAMP}${N}"
@@ -1077,6 +1125,27 @@ render_tech() {
         echo -e "  utun-туннелей:   ${Y}${UTUN}${N} ${D}(много следов VPN/Network Extension)${N}"
     else
         echo -e "  utun-туннелей:   ${Y}${UTUN}${N} ${D}(очень много следов VPN/Network Extension)${N}"
+    fi
+
+    # VPN-ВЫХОД: протокол (то, что отдаёт ОС) + тип IP (эвристика по ASN). read-only, без ключей.
+    local _vpnp; _vpnp=$(vpn_protocols)
+    if [ -n "$_vpnp" ] || [ "$VPN_ACTIVE" -eq 1 ]; then
+        echo
+        echo -e "${B}=== VPN-ВЫХОД ===${N}"
+        if [ -n "$_vpnp" ]; then
+            echo -e "  Протоколы:    ${C}${_vpnp}${N}"
+        else
+            echo -e "  Протоколы:    ${D}ОС не раскрывает (см. клиент VPN)${N}"
+        fi
+        if [ -n "$ORG" ]; then
+            if org_is_datacenter "$ORG"; then
+                echo -e "  Тип выхода:   ${Y}похоже на дата-центр/хостинг${N} ${D}— такие IP чаще ловят антибот AI-сервисов${N}"
+            else
+                echo -e "  Тип выхода:   ${D}по названию не похоже на хостинг; резидентный IP — доверие выше (точно скажет лишь платная база)${N}"
+            fi
+        fi
+        echo -e "  ${D}Репутация IP: по факту — если сайты отвечают «you have been blocked»/403, этот IP режут.${N}"
+        echo -e "  ${D}Точная blacklist-проверка = платный API + отправка IP третьим; по умолчанию не делаем.${N}"
     fi
 
     if [ "$WIFI" -eq 1 ] && { [ -n "$RSSI" ] || [ -n "$BAND" ]; }; then
