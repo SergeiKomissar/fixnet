@@ -213,7 +213,7 @@ ni_step() { nl_spin_stop; NI_STEP=$((NI_STEP+1)); nl_spin_start "$1 (${NI_STEP}/
 # чистим по УЗКОМУ префиксу netinfo-ai.* (не трогаем чужие файлы в каталоге).
 cleanup() {
     nl_spin_stop 2>/dev/null
-    rm -f "$(nl_tmp_dir 2>/dev/null)"/netinfo-ai.* 2>/dev/null
+    rm -f "$(nl_tmp_dir 2>/dev/null)"/netinfo-ai.* "$(nl_tmp_dir 2>/dev/null)"/netinfo-why.* 2>/dev/null
 }
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
@@ -256,6 +256,7 @@ netinfo — осмотр сети macOS
   netinfo --scan       показать соседние Wi-Fi сети (read-only, не подключает)
   netinfo --json       машиночитаемый вывод (факты и коды состояний; без рендера)
   netinfo --explain    пояснить термины простым языком (DNS, TLS, 403 и т.п.)
+  netinfo --why URL    почему не открывается ресурс (слой отказа: DNS/TCP/TLS/HTTP)
   netinfo --ai         доступность AI-сервисов через VPN (OpenAI + Claude; TLS-проба)
   netinfo --ai all     + Gemini + Z.AI;  netinfo --ai list — показать цели проверки
   netinfo --no-ai      не показывать AI-блок в обычном выводе
@@ -290,6 +291,7 @@ PROBE=0         # 1 = проба TCP/UDP-выхода (Фаза 5: оценка 
 SCAN=0          # 1 = скан соседних Wi-Fi сетей (Фаза 6: read-only)
 JSON=0          # 1 = машиночитаемый JSON-вывод (Фаза 6.1: стабильный контракт)
 EXPLAIN=0       # 1 = пояснить термины простым языком (Фаза 12; клавиша ? в меню)
+WHY_URL=""      # непусто = режим --why URL (Фаза 13: на каком слое не открывается ресурс)
 WANT_AI=1       # 0 = не показывать AI-блок в обычном выводе (опт-аут --no-ai)
 AI_FORCE=0      # 1 = режим netinfo --ai (проверить всегда, даже без VPN)
 AI_MODE="default"  # default = OpenAI+Claude; all = + Gemini + Z.AI
@@ -310,6 +312,8 @@ while [ $# -gt 0 ]; do
         --scan)       SCAN=1 ;;
         --json)       JSON=1 ;;
         --explain)    EXPLAIN=1 ;;
+        --why)        if [ "$#" -ge 2 ]; then WHY_URL="$2"; shift; else WHY_URL="-"; fi ;;
+        --why=*)      WHY_URL="${1#--why=}" ;;
         --ai)         AI_FORCE=1
                       if [ "$#" -ge 2 ]; then
                           case "$2" in all) AI_MODE="all"; shift ;; list) AI_LIST=1; shift ;; esac
@@ -418,10 +422,15 @@ check_dns() {
 # (непустой Answer). Якоря: Cloudflare → Google (двух достаточно; третий только тормозил
 # бы плохую сеть). ⚠ ИНВАРИАНТ: DoH-успех НЕ равен «системный DNS работает» — приложения
 # могут не использовать DoH. Это лишь «резолвинг в принципе возможен».
-doh_probe() {
+doh_probe() { doh_resolve ya.ru; }
+
+# DoH-резолв КОНКРЕТНОГО хоста (Фаза 13: --why). 0 — резолвится через DoH. Хост обычный
+# (буквы/цифры/точки/дефисы) — URL-кодирование не нужно.
+doh_resolve() {
     command -v curl >/dev/null 2>&1 || return 1
-    local u r
-    for u in "https://1.1.1.1/dns-query?name=ya.ru&type=A" "https://dns.google/resolve?name=ya.ru&type=A"; do
+    local h="$1" u r
+    [ -z "$h" ] && return 1
+    for u in "https://1.1.1.1/dns-query?name=${h}&type=A" "https://dns.google/resolve?name=${h}&type=A"; do
         r=$(curl -s --max-time 5 -H 'accept: application/dns-json' "$u" 2>/dev/null)
         case "$r" in *'"Status":0'*'"data"'*) return 0 ;; esac
     done
@@ -2126,6 +2135,180 @@ print(json.dumps(out, ensure_ascii=False, indent=2))
 PY
 }
 
+# ---- Фаза 13: `netinfo --why URL` — на каком слое не открывается ресурс ----
+# Послойная диагностика: интернет → DNS(+DoH) → TCP → TLS → HTTP(код+тело). Контраст
+# «сеть или ресурс» (контрольная проверка интернета). read-only: один GET --range 0-0
+# (1 байт), без ключей, без записи state, систему НЕ меняем. Честно: называем СЛОЙ
+# отказа, НЕ «причину блокировки»; не пишем «РКН/DPI/госблок».
+why_report() {
+    local url="$1"
+    echo
+    echo -e "${B}=== Почему не открывается ресурс ===${N}"
+    case "$url" in
+        http://*|https://*) : ;;
+        "") echo -e "  ${D}Укажи полный URL: ${C}netinfo --why https://example.com/file${N}"; echo; return ;;
+        *)  echo -e "  ${Y}Нужен полный URL со схемой, напр.: ${C}netinfo --why https://${url}${N}"; echo; return ;;
+    esac
+    command -v curl >/dev/null 2>&1 || { echo -e "  ${D}Нужен curl.${N}"; echo; return; }
+    local scheme host
+    scheme="${url%%://*}"
+    host=$(printf '%s' "$url" | sed -E 's#^[a-z]+://##; s#@[^/]*##; s#[:/].*$##')
+    echo -e "  Ресурс:             ${C}${url}${N}"
+    echo -e "  Хост:               ${C}${host}${N}"
+    [ "$scheme" = "http" ] && echo -e "  ${Y}Схема: HTTP — соединение не шифруется.${N}"
+    # VPN — только как контекст (route на utun); без geo, чтобы не тормозить.
+    local extdev vpn=0
+    extdev=$(route -n get "$PROBE_IP1" 2>/dev/null | awk '/interface:/{print $2}')
+    case "$extdev" in utun*) vpn=1 ;; esac
+    [ "$vpn" -eq 1 ] && echo -e "  VPN:                ${G}активен${N}" \
+                     || echo -e "  VPN:                ${D}не активен (проверка напрямую)${N}"
+
+    nl_spin_start "проверяю ${host}"
+    # Контроль «сеть вообще жива» — отделяет «у меня сеть лежит» от «ресурс не открывается».
+    local base_ok=0
+    { [ "$(http_code "$HTTP_URL1")" = "204" ] || [ "$(http_code "$HTTP_URL2")" = "200" ]; } && base_ok=1
+    # DNS хоста (обычный → DoH-фолбэк). IP-литерал DNS не требует — считаем разрешённым.
+    local hip="" dns_ok=0 doh_ok=0
+    if printf '%s' "$host" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        hip="$host"; dns_ok=1
+    else
+        command -v dig >/dev/null 2>&1 && hip=$(dig +short +time=3 +tries=1 A "$host" 2>/dev/null | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+        [ -n "$hip" ] && dns_ok=1
+        [ "$dns_ok" -eq 0 ] && { doh_resolve "$host" && doh_ok=1; }
+    fi
+    # ОДИН curl: тайминги по слоям + код + тип + тело (1 байт через range).
+    local bf; nl_ensure_tmp_dir; bf=$(mktemp "$(nl_tmp_dir)/netinfo-why.XXXXXX" 2>/dev/null) || bf="$(nl_tmp_dir)/netinfo-why.$$"
+    : > "$bf"
+    local meta rc code tcon tapp ctype
+    meta=$(LC_ALL=C curl -sS -L --range 0-0 -o "$bf" --connect-timeout 5 --max-time 12 \
+           -w '%{http_code}\t%{time_connect}\t%{time_appconnect}\t%{content_type}' "$url" 2>/dev/null); rc=$?
+    nl_spin_stop
+    code=$(printf '%s' "$meta" | cut -f1); tcon=$(printf '%s' "$meta" | cut -f2)
+    tapp=$(printf '%s' "$meta" | cut -f3); ctype=$(printf '%s' "$meta" | cut -f4)
+    local tcp_ok=0 tls_ok=0
+    awk "BEGIN{exit !(($tcon+0)>0)}" && tcp_ok=1
+    awk "BEGIN{exit !(($tapp+0)>0)}" && tls_ok=1
+
+    # --- Классификация по слою ---
+    local wclass="" wreason="-"
+    if [ "$dns_ok" -eq 0 ] && [ "$doh_ok" -eq 0 ]; then
+        if [ "$base_ok" -eq 0 ]; then wclass="local_network"; else wclass="dns_problem"; fi
+    elif [ "$dns_ok" -eq 0 ] && [ "$doh_ok" -eq 1 ]; then
+        wclass="dns_doh_only"
+    elif [ "$rc" -ne 0 ] || [ -z "$code" ] || [ "$code" = "000" ]; then
+        if   [ "$tcp_ok" -eq 0 ]; then { [ "$base_ok" -eq 0 ] && wclass="local_network"; } || wclass="tcp_blocked"
+        elif [ "$tls_ok" -eq 0 ]; then wclass="tls_blocked"
+        else wclass="slow_or_timeout"; fi
+    else
+        # HTTP-ответ есть → код+тело. Переиспользуем ai_classify (регион/antibot/needs_key/451).
+        local lb cls v
+        lb=$(head -c 8192 "$bf" 2>/dev/null | tr 'A-Z' 'a-z')
+        cls=$(ai_classify "$code" "$lb"); v=$(printf '%s' "$cls" | cut -f1); wreason=$(printf '%s' "$cls" | cut -f2)
+        if   [ "$v" = "blocked" ]; then wclass="http_forbidden"
+        elif [ "$v" = "unconfirmed" ]; then wclass="auth_required"
+        else
+            case "$code" in
+                401) wclass="auth_required" ;;
+                404) wclass="not_found" ;;
+                429) wclass="rate_limited" ;;
+                5*)  wclass="server_error" ;;
+                2*)  case "$ctype" in
+                         text/html*) why_is_file "$url" && wclass="html_instead_of_file" || wclass="ok" ;;
+                         *) wclass="ok" ;;
+                     esac ;;
+                3*)  wclass="redirect_loop" ;;
+                *)   wclass="ok" ;;
+            esac
+        fi
+    fi
+    rm -f "$bf" 2>/dev/null
+
+    # --- Проверки (человеческий послойный срез) ---
+    echo
+    echo -e "  ${D}Проверки:${N}"
+    if   [ "$dns_ok" -eq 1 ]; then echo -e "     Адрес сайта:       ${G}найден${N} ${D}(${hip})${N}"
+    elif [ "$doh_ok" -eq 1 ]; then echo -e "     Адрес сайта:       ${Y}обычным способом не найден, но найден защищённой проверкой${N}"
+    else echo -e "     Адрес сайта:       ${R}не найден${N}"; fi
+    if [ "$dns_ok" -eq 1 ] || [ "$doh_ok" -eq 1 ]; then
+        [ "$tcp_ok" -eq 1 ] && echo -e "     Дозвон до сервера: ${G}есть${N}" || echo -e "     Дозвон до сервера: ${R}нет${N}"
+        if   [ "$tls_ok" -eq 1 ]; then echo -e "     Защищ. соединение: ${G}установлено${N}"
+        elif [ "$tcp_ok" -eq 1 ]; then echo -e "     Защищ. соединение: ${R}не установилось${N}"; fi
+        if [ -n "$code" ] && [ "$code" != "000" ]; then
+            echo -e "     Ответ сервера:     ${C}HTTP ${code}${N}"
+            [ -n "$ctype" ] && echo -e "     Тип ответа:        ${D}${ctype}${N}"
+        else
+            echo -e "     Ответ сервера:     ${R}не получен${N}"
+        fi
+    fi
+
+    # --- Вывод (слой отказа + что доказано + что попробовать) ---
+    echo
+    local vpnhint=""
+    [ "$vpn" -eq 0 ] && vpnhint="включи VPN и повтори: netinfo --why ${url}" || vpnhint="попробуй другой сервер VPN и повтори"
+    case "$wclass" in
+        ok)
+            echo -e "  Вывод: ${G}Ресурс отвечает нормально (HTTP ${code}).${N}"
+            echo -e "  ${D}Если в браузере всё равно не открывается — дело в самом приложении/расширении/кэше, не в сети.${N}" ;;
+        local_network)
+            echo -e "  Вывод: ${R}Проблема не в этом ресурсе — не прошла даже контрольная проверка интернета.${N}"
+            echo -e "  ${D}Сначала почини сеть: запусти netinfo (общий осмотр) или войди в Wi-Fi-портал.${N}" ;;
+        dns_problem)
+            echo -e "  Вывод: ${Y}Интернет есть, но имя «${host}» не находится ни обычной, ни защищённой проверкой.${N}"
+            echo -e "  ${D}Либо домена не существует (опечатка?), либо DNS этой сети его фильтрует.${N}"
+            echo -e "  ${D}Если сайт точно существует — попробуй sudo fixnet --dns или VPN и повтори.${N}" ;;
+        dns_doh_only)
+            echo -e "  Вывод: ${Y}Имя «${host}» не находится обычной проверкой, но находится защищённой (DoH).${N}"
+            echo -e "  ${D}Обычный DNS сети ведёт себя странно; ресурс может открыться через VPN или смену DNS.${N}" ;;
+        tcp_blocked)
+            echo -e "  Вывод: ${Y}Адрес нашёлся, но соединение с сервером не устанавливается.${N}"
+            echo -e "  ${D}Не похоже на Wi-Fi: возможна фильтрация маршрута или недоступность сервера из этой сети.${N}"
+            echo -e "  ${D}${vpnhint}.${N}" ;;
+        tls_blocked)
+            echo -e "  Вывод: ${Y}До сервера дозвонились, но защищённое соединение не встаёт.${N}"
+            echo -e "  ${D}Возможны фильтрация TLS, корпоративный прокси, сбой сертификата или несовместимость.${N}"
+            echo -e "  ${D}${vpnhint}.${N}" ;;
+        http_forbidden)
+            echo -e "  Вывод: ${R}До сервера достучались, но он отклонил доступ (HTTP ${code}).${N}"
+            case "$wreason" in
+                cloudflare_antibot|cloudflare_1020|blocked_page|access_denied)
+                    echo -e "  ${D}Похоже на антибот-защиту (IP сервера/VPN в чёрном списке). Смени сервер/IP (лучше не дата-центр).${N}" ;;
+                http_403_forbidden)
+                    # «голый» 403 без явного маркера — НЕ утверждаем регион. Перечисляем причины.
+                    echo -e "  ${D}Сервер/CDN отклонил доступ. Возможные причины: авторизация, политика сайта, IP VPN, регион или антибот-защита.${N}"
+                    echo -e "  ${D}Попробуй другой VPN-сервер или войди в аккаунт, если ресурс закрытый.${N}" ;;
+                *)  # явный региональный/политический маркер (unsupported_country/location/451/request_not_allowed)
+                    echo -e "  ${D}Похоже на отказ по региону/политике (сервис не поддерживает этот регион). Смени страну VPN и повтори.${N}" ;;
+            esac ;;
+        auth_required)
+            echo -e "  Вывод: ${Y}Ресурс жив, но требует вход или ключ (HTTP ${code}).${N}"
+            echo -e "  ${D}Это не блокировка — нужна авторизация, cookie или прямая ссылка (не страница входа).${N}" ;;
+        html_instead_of_file)
+            echo -e "  Вывод: ${Y}Сервер ответил HTML-страницей вместо файла.${N}"
+            echo -e "  ${D}Вероятно, ссылка ведёт на страницу входа/предпросмотр или это непрямая ссылка, а не сам файл.${N}" ;;
+        not_found)
+            echo -e "  Вывод: ${Y}Сервер ответил 404 — по этому адресу ресурс не найден (возможно, ссылка устарела).${N}" ;;
+        rate_limited)
+            echo -e "  Вывод: ${Y}Сервер ответил 429 — слишком много запросов. Повтори позже.${N}" ;;
+        server_error)
+            echo -e "  Вывод: ${Y}Сервер ответил ошибкой (HTTP ${code}) — проблема на стороне сервиса, не у тебя.${N}" ;;
+        redirect_loop)
+            echo -e "  Вывод: ${Y}Редиректы зациклились (HTTP ${code}) — возможно, нужна авторизация или cookie.${N}" ;;
+        slow_or_timeout)
+            echo -e "  Вывод: ${Y}Соединение установилось, но ответ не пришёл за отведённое время (таймаут).${N}"
+            echo -e "  ${D}Маршрут/канал перегружен или сервер не отвечает. Повтори позже; ${vpnhint}.${N}" ;;
+    esac
+    echo -e "  ${D}Это проверка СЛОЯ отказа (read-only, 1 байт). Не проверка причины блокировки, аккаунта или содержимого.${N}"
+    echo
+}
+
+# Похоже ли, что URL запрашивает ФАЙЛ (по расширению пути) — для «HTML вместо файла».
+why_is_file() {
+    case "$1" in
+        *.pdf|*.zip|*.docx|*.xlsx|*.pptx|*.csv|*.jpg|*.jpeg|*.png|*.gif|*.mp4|*.mp3|*.dmg|*.pkg|*.exe|*.tar|*.gz|*.tgz|*.7z|*.rar|*.iso|*.apk) return 0 ;;
+    esac
+    return 1
+}
+
 # ===================== ДИСПЕТЧЕР =====================
 # Сбор — ОДИН раз; дальше только рендеры. Меню — лишь когда вывод в терминал.
 if [ "$MTU_PROBE" -eq 1 ]; then mtu_report; exit 0; fi
@@ -2133,6 +2316,7 @@ if [ "$PROBE" -eq 1 ]; then probe_report; exit 0; fi
 if [ "$SCAN" -eq 1 ]; then scan_report; exit 0; fi
 if [ "$AI_FORCE" -eq 1 ]; then ai_report; exit 0; fi
 if [ "$EXPLAIN" -eq 1 ]; then render_explain; exit 0; fi
+if [ -n "$WHY_URL" ]; then why_report "$([ "$WHY_URL" = "-" ] && echo "" || echo "$WHY_URL")"; exit 0; fi
 collect_all
 if [ "$JSON" -eq 1 ]; then json_report; exit 0; fi
 if [ "$TECH" -eq 1 ]; then
