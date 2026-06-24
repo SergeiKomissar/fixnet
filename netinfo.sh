@@ -1283,13 +1283,16 @@ interactive_menu() {
     [ "${WIFI:-0}" -eq 1 ] && wopt=" · s — Wi-Fi сети"
     while true; do
         echo
-        printf "  Enter — закрыть · t — детали · a — советы · r — обновить%s%s · i — AI · ? — пояснения: " "$opt" "$wopt"
+        printf "  Enter — закрыть · t — детали · a — советы · r — обновить%s%s · i — AI · u — почему ссылка · ? — пояснения: " "$opt" "$wopt"
         read -r choice || break
         case "$choice" in
             t|T) divider; render_tech ;;
             a|A) divider; render_advice ;;
             s|S) divider; scan_report ;;
             i|I) divider; AI_MODE="all"; AI_LIST=0; ai_report ;;   # по `i` — полный набор (+Gemini+Z.AI)
+            u|U) divider; printf "  Вставь ссылку (Cmd+V) и Enter: "; read -r _u
+                 _u=$(printf '%s' "${_u:-}" | tr -d '\r\n' | sed 's/^ *//; s/ *$//')
+                 if [ -n "$_u" ]; then why_report "$_u"; else echo "  Ссылка не указана."; fi ;;
             \?)  divider; render_explain ;;
             r|R) divider; collect_all; render_human
                  [ "${CAPTIVE:-0}" -eq 1 ] && opt=" · o — вход в сеть" || opt=""
