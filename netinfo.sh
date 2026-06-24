@@ -832,14 +832,18 @@ if [ "$MAIN_OK" -eq 1 ]; then
     # Хвост про качество канала (общий для всех веток). Пусто при green.
     QSUFFIX=""
     case "$QLEVEL" in
-        yellow) QSUFFIX=", но канал медленный — большие загрузки лучше отложить" ;;
+        yellow) QSUFFIX=", но канал нестабильный — видеосвязь и большие загрузки лучше отложить" ;;
         red)    QSUFFIX=", но канал плохой — видеосвязь и большие загрузки лучше отложить" ;;
     esac
     # Фаза 7: если при активном VPN проверяли AI — итог про то, ради чего VPN включён.
     # Это приоритетнее общих формулировок (но верхняя строка 🟡 ОТКРЫТАЯ всё равно видна).
     if   [ "$VPN_ACTIVE" -eq 1 ] && [ "${AI_RUN:-0}" -eq 1 ] && [ "$AI_TOTAL" -gt 0 ]; then
         if   [ "$AI_BAD" -gt 0 ]; then
-            if   [ "$AI_BAD" -eq "$AI_TOTAL" ] && [ "$AI_BLOCKED" -gt 0 ] && [ "$AI_UNREACH" -eq 0 ]; then
+            if   [ "$AI_UNREACH" -eq "$AI_TOTAL" ]; then
+                # ВСЕ разом не ответили — похоже на временный сбой маршрута/VPN, а не блок
+                # каждого сервиса. Не пугаем «смени страну»: сначала повтор.
+                WORK="VPN включён, но все AI-домены разом не ответили — похоже на временный сбой; повтори (r/i), если повторяется — смени сервер VPN"
+            elif [ "$AI_BAD" -eq "$AI_TOTAL" ] && [ "$AI_BLOCKED" -gt 0 ] && [ "$AI_UNREACH" -eq 0 ]; then
                 WORK="VPN включён, но AI API-домены отклоняют доступ (регион или репутация IP) — смени страну или сервер VPN"
             elif [ "$AI_BAD" -eq "$AI_TOTAL" ]; then
                 WORK="VPN включён, но AI API-домены недоступны через текущий сервер — смени страну/сервер VPN"
@@ -1459,6 +1463,13 @@ render_explain() {
     echo -e "  ${C}Туннели (utun)${N}"
     echo -e "  ${D}  Виртуальные туннели macOS (их создают VPN и системные расширения). Много —${N}"
     echo -e "  ${D}  не авария, но при обрывах стоит закрыть VPN-клиенты или перезагрузить Mac.${N}"
+    echo -e "  ${C}AI API-домены${N}"
+    echo -e "  ${D}  Входы к сервисам вроде OpenAI или Claude для программного доступа. Если домен${N}"
+    echo -e "  ${D}  отвечает — сеть до сервиса проходит, но это ещё НЕ проверка аккаунта, API-ключа${N}"
+    echo -e "  ${D}  и не запрос к самой модели.${N}"
+    echo -e "  ${C}Tailscale DNS (100.100.100.100)${N}"
+    echo -e "  ${D}  Обслуживает внутренние имена твоей tailnet. Сам по себе НЕ означает, что весь${N}"
+    echo -e "  ${D}  внешний интернет идёт через Tailscale (это split-VPN, внешний IP он не меняет).${N}"
     echo
     echo -e "  ${D}Технические значения (TLS-мс, HTTP-коды, RTT min/avg/max) — в netinfo --tech.${N}"
     echo
@@ -1489,6 +1500,14 @@ for k,e in d.items():
         n=unicodedata.normalize("NFC",name)
         if n not in seen: seen.add(n); print(n)
 PY
+}
+
+# Добивка строки пробелами до ШИРИНЫ В СИМВОЛАХ (не байтах): printf %-Ns и ${#} считают
+# кириллицу/эмодзи в БАЙТАХ (локаль скрипта — C), и колонки разъезжаются. Символы надёжно
+# считает `wc -m` под UTF-8-локалью (точечно, без глобальной смены локали).
+scol() {
+    local n; n=$(printf '%s' "$1" | LC_ALL=en_US.UTF-8 wc -m | tr -d ' ')
+    printf '%s' "$1"; while [ "$n" -lt "$2" ]; do printf ' '; n=$((n+1)); done
 }
 
 scan_report() {
@@ -1597,7 +1616,7 @@ PY
         echo -e "  для Терминала (Настройки → Конфиденциальность → Службы геолокации). Кнопка идёт под sudo.${N}"
         echo; return
     fi
-    printf "  %-22s %9s   %-15s %-9s %s\n" "сеть" "сигнал" "диапазон/канал" "защита" "примечание"
+    { printf '  '; scol "сеть" 26; scol "сигнал" 10; scol "диапазон/канал" 17; scol "защита" 13; echo "примечание"; }
     local has_open=0 saw_saved=0
     while IFS=$'\t' read -r name band chan width sec rssi iscur saved; do
         [ -z "$name" ] || [ "$name" = "-" ] && continue
@@ -1616,7 +1635,7 @@ PY
         if   [ "$iscur" = "1" ]; then note="← вы здесь"
         elif [ "$saved" = "1" ]; then note="★ сохранена"; saw_saved=1
         fi
-        printf "  %-22s %9s   %-15s %-9s %s\n" "$name" "$sigcell" "$bc" "$sech" "$note"
+        { printf '  '; scol "$name" 26; scol "$sigcell" 10; scol "$bc" 17; scol "$sech" 13; printf '%s\n' "$note"; }
     done <<EOF
 $data
 EOF
@@ -1842,6 +1861,9 @@ ai_report() {
         else
             echo -e "  Вывод: ${G}отвечают: ${AI_OK_NAMES}${N}${Y}; без ключа не подтверждены: ${AI_UNCONF_NAMES}.${N}"
         fi
+    elif [ "$AI_UNREACH" -eq "$AI_TOTAL" ]; then
+        echo -e "  ${Y}Все AI-домены одновременно дали таймаут.${N} ${D}Похоже на временный сбой маршрута/VPN,${N}"
+        echo -e "  ${D}а не на блок каждого сервиса. Повтори проверку (r/i); если повторяется — смени сервер VPN.${N}"
     elif [ "$AI_BAD" -eq "$AI_TOTAL" ]; then
         if [ "$AI_BLOCKED" -gt 0 ] && [ "$AI_UNREACH" -eq 0 ]; then
             echo -e "  Вывод: ${Y}все AI API-домены отклоняют доступ из этого региона — смени страну VPN.${N}"
