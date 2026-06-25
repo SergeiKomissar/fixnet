@@ -479,13 +479,16 @@ dns_apply() {
     fi
 
     if check_dns; then
-        echo -e "${G}DNS временно заменены на ${DNS_REPAIR} — имена резолвятся.${N}"
-        echo -e "  Исходные DNS сохранены. Вернуть: ${Y}sudo fixnet --dns-restore${N}"
+        echo -e "${G}DNS-серверы временно заменены на ${DNS_REPAIR}.${N}"
+        echo -e "  ${G}Проверка DNS: OK — имена резолвятся.${N}"
+        echo -e "  Откат: ${Y}sudo fixnet --dns-restore${N}"
         dns_ops_log applied
         exit 0
     else
-        echo -e "${Y}DNS заменён, но резолв всё ещё не идёт — откатываю.${N}"
+        echo -e "${Y}DNS после замены всё ещё не работает — восстанавливаю исходные настройки из бэкапа.${N}"
         dns_restore
+        echo -e "  ${D}Вероятно, проблема глубже: VPN/Network Extension, роутер, captive portal или сетевой стек.${N}"
+        echo -e "  ${D}Закрой VPN-клиенты и перезагрузи Mac.${N}"
         exit 1
     fi
 }
