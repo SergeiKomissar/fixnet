@@ -1456,39 +1456,64 @@ PY
 # Печать факта рефлектора с учётом "skip" (инструмента нет → "не проверено").
 _probe_word() { case "$1" in yes) echo "${G}отвечает${N}";; no) echo "${R}не ответил${N}";; *) echo "${D}не проверено${N}";; esac; }
 
+# TLS-проба: дозвон (TCP) + рукопожатие (TLS) к домену. Развязывает СЛОЙ: TCP есть, а TLS
+# рвётся = возможна TLS/SNI-фильтрация (или прокси/сертификат). Через curl-тайминги:
+# time_connect>0 → TCP встал; time_appconnect>0 → TLS встал.
+probe_tls() {  # host -> tls_ok | tcp_only | tcp_fail | skip
+    command -v curl >/dev/null 2>&1 || { echo "skip"; return; }
+    local w tc ta
+    w=$(LC_ALL=C curl -sS -o /dev/null --connect-timeout 4 --max-time 8 \
+        -w '%{time_connect} %{time_appconnect}' "https://$1/" 2>/dev/null)
+    tc=$(printf '%s' "$w" | awk '{print $1}'); ta=$(printf '%s' "$w" | awk '{print $2}')
+    awk "BEGIN{exit !(($tc+0)>0)}" || { echo "tcp_fail"; return; }
+    awk "BEGIN{exit !(($ta+0)>0)}" && echo "tls_ok" || echo "tcp_only"
+}
+_tls_word() { case "$1" in
+    tls_ok)   echo "${G}TLS ok${N}" ;;
+    tcp_only) echo "${Y}TCP есть, TLS рвётся${N}" ;;
+    tcp_fail) echo "${R}TCP нет${N}" ;;
+    *)        echo "${D}не проверено${N}" ;;
+esac; }
+
 probe_report() {
-    local tcp_ip tcp_dom udp_dns udp_ntp udp_stun
+    local tcp_ip tcp_dom udp_dns udp_ntp udp_stun tls_cf tls_gh tcp_base=0 CLASS=""
     echo
-    echo -e "${B}=== Проверка ограничений TCP/UDP для VPN ===${N}"
-    [ -t 1 ] || echo -e "  ${D}Проверяю TCP/UDP-выход…${N}"
-    nl_spin_start "проверяю TCP/UDP-выход"
-    tcp_ip=$(probe_tcp 1.1.1.1 443)          # IP-baseline без DNS
-    tcp_dom=$(probe_tcp www.apple.com 443)   # требует DNS — для развязки «DNS vs сеть»
+    echo -e "${B}=== Проверка ограничений TCP/UDP/TLS для VPN ===${N}"
+    [ -t 1 ] || echo -e "  ${D}Проверяю выход…${N}"
+    nl_spin_start "проверяю TCP/UDP/TLS-выход"
+    tcp_ip=$(probe_tcp 1.1.1.1 443)          # IP-anchor: TCP без DNS
+    tcp_dom=$(probe_tcp www.apple.com 443)   # domain-anchor: DNS + TCP
     udp_dns=$(probe_udp_dns)
     udp_ntp=$(probe_udp_ntp)
     udp_stun=$(probe_udp_stun)
+    [ "$tcp_ip" = "open" ] || [ "$tcp_dom" = "open" ] && tcp_base=1
+    tls_cf="-"; tls_gh="-"
+    # TLS-пробы — только если DNS+TCP до домена живы (иначе TLS-fail = это DNS, не SNI).
+    if [ "$tcp_base" -eq 1 ] && [ "$tcp_dom" = "open" ]; then
+        tls_cf=$(probe_tls cloudflare.com); tls_gh=$(probe_tls github.com)
+    fi
     nl_spin_stop
 
-    # --- Таблица фактов (только то, что реально проверено) ---
+    # --- Карта проверок (прозрачное основание вывода: какие домены/порты прошли) ---
     echo
+    echo -e "  ${D}Карта проверок:${N}"
     echo -e "  ${D}TCP:${N}"
-    case "$tcp_ip"  in open) echo -e "    1.1.1.1:443          ${G}open${N}";; closed) echo -e "    1.1.1.1:443          ${R}не открылся${N}";; *) echo -e "    1.1.1.1:443          ${D}не проверено (нет nc)${N}";; esac
-    case "$tcp_dom" in open) echo -e "    www.apple.com:443    ${G}open${N}";; closed) echo -e "    www.apple.com:443    ${R}не открылся${N}";; *) echo -e "    www.apple.com:443    ${D}не проверено${N}";; esac
+    case "$tcp_ip"  in open) echo -e "    внешний IP    1.1.1.1:443        ${G}open${N}";; closed) echo -e "    внешний IP    1.1.1.1:443        ${R}не открылся${N}";; *) echo -e "    внешний IP    1.1.1.1:443        ${D}не проверено (нет nc)${N}";; esac
+    case "$tcp_dom" in open) echo -e "    внешний домен www.apple.com:443  ${G}open${N}";; closed) echo -e "    внешний домен www.apple.com:443  ${R}не открылся${N}";; *) echo -e "    внешний домен www.apple.com:443  ${D}не проверено${N}";; esac
+    if [ "$tls_cf" != "-" ] || [ "$tls_gh" != "-" ]; then
+        echo -e "  ${D}TLS (поверх TCP):${N}"
+        echo -e "    cloudflare.com:443   $(_tls_word "$tls_cf")"
+        echo -e "    github.com:443       $(_tls_word "$tls_gh")"
+    fi
     echo -e "  ${D}UDP-рефлекторы:${N}"
     echo -e "    53/DNS @1.1.1.1      $(_probe_word "$udp_dns")"
     echo -e "    123/NTP              $(_probe_word "$udp_ntp")"
     echo -e "    3478/STUN            $(_probe_word "$udp_stun")"
     echo
 
-    # --- Вывод (по весовой логике; TCP-baseline обязателен для UDP-вердикта) ---
-    local tcp_base=0
-    [ "$tcp_ip" = "open" ] || [ "$tcp_dom" = "open" ] && tcp_base=1
-
+    # --- Классификация: ОДИН диагностический тег *_like, строго по фактам, вероятностно ---
     if [ "$tcp_base" -eq 0 ]; then
-        # Внешние контрольные (1.1.1.1, apple) закрыты. РАЗВИЛКА: общий обрыв vs частичная
-        # доступность. Допробуем РЕГИОНАЛЬНЫЕ контрольные хосты (НЕ «локальные» — локальное это
-        # 192.168/.local/роутер). Доказываем только ПАТТЕРН (внешние нет / региональные да),
-        # НЕ механизм: «белый список» пишем как «похоже/возможен», не как факт.
+        # внешний TCP закрыт. Региональные открыты → whitelist_like; всё закрыто → tcp_block_like.
         local allow_open=0 allow_tested=0 _basis=""
         for _h in ya.ru vk.com; do
             local _r; _r=$(probe_tcp "$_h" 443)
@@ -1498,12 +1523,12 @@ probe_report() {
             else _basis="${_basis} ${_h} — нет;"; fi
         done
         if [ "$allow_tested" -ge 1 ] && [ "$allow_open" -ge 1 ]; then
+            CLASS="whitelist_like"
             if [ "$allow_open" -ge 2 ]; then
                 echo -e "  Вывод: ${Y}Похоже на частичную доступность / белый список.${N}"
             else
                 echo -e "  Вывод: ${Y}Возможна частичная доступность, но признак слабый: открылся только один региональный контрольный хост.${N}"
             fi
-            # IP-anchor (1.1.1.1, без DNS) и domain-anchor (apple.com, DNS+CDN) — РАЗНЫЙ тип контроля, не смешиваем.
             echo -e "  ${D}Контрольные: внешний IP (1.1.1.1) — нет; внешний домен (apple.com) — нет; региональные:${_basis}${N}"
             echo -e "  ${D}Это не похоже на полный обрыв интернета.${N}"
             if [ "${VPN_ACTIVE:-0}" -eq 1 ]; then
@@ -1512,37 +1537,46 @@ probe_report() {
                 echo -e "  ${D}Возможна частичная доступность, режим белого списка или фильтрация сети; механизм не доказан.${N}"
             fi
         else
+            CLASS="tcp_block_like"
             echo -e "  Вывод: ${Y}TCP 443 наружу не открывается.${N}"
-            echo -e "  ${D}Это сначала про связь / портал / локальную фильтрацию, а не про DPI."
-            echo -e "  Проверь основной осмотр: netinfo${N}"
+            echo -e "  ${D}Похоже на отсутствие выхода / портал / фильтрацию связи, а не на DPI. Проверь: netinfo${N}"
         fi
-        echo
-        return
-    fi
-
-    # «IP открыт, домен — нет» = это DNS, не DPI (важная развязка).
-    if [ "$tcp_ip" = "open" ] && [ "$tcp_dom" = "closed" ]; then
-        echo -e "  ${Y}Замечание:${N} TCP до 1.1.1.1 открыт, до www.apple.com — нет → ${D}похоже на проблему DNS, не сети.${N}"
-    fi
-
-    # Весовая логика UDP (STUN — лучший прокси произвольного UDP, потому весомее).
-    local strong=0 yescount=0
-    [ "$udp_dns"  = "yes" ] && yescount=$((yescount+1))
-    [ "$udp_ntp"  = "yes" ] && yescount=$((yescount+1))
-    [ "$udp_stun" = "yes" ] && yescount=$((yescount+1))
-    { [ "$udp_stun" = "yes" ] || [ "$yescount" -ge 2 ]; } && strong=1
-
-    if [ "$strong" -eq 1 ]; then
-        echo -e "  Вывод: ${G}Общий UDP-выход работает. Полной блокировки UDP не видно.${N}"
-        echo -e "  ${D}Если конкретный VPN всё равно не работает — возможна точечная блокировка"
-        echo -e "  порта/протокола, MTU или проблема сервера (это отсюда не доказывается).${N}"
-    elif [ "$yescount" -ge 1 ]; then
-        echo -e "  Вывод: ${Y}Проходит лишь часть UDP (служебные порты), произвольный UDP отвечает плохо.${N}"
-        echo -e "  ${D}UDP-VPN может не подключаться. Попробуй VPN через TCP 443 / Lightway TCP / OpenVPN TCP.${N}"
+    elif [ "$tcp_ip" = "open" ] && [ "$tcp_dom" = "closed" ]; then
+        CLASS="dns_block_like"
+        echo -e "  Вывод: ${Y}TCP до внешнего IP (1.1.1.1) есть, до домена (apple.com) — нет.${N}"
+        echo -e "  ${D}Похоже на проблему/фильтр DNS, а не саму сеть. Возможна блокировка или подмена DNS;${N}"
+        echo -e "  ${D}механизм не доказан. Попробуй DoH / другой DNS (sudo fixnet --dns) или VPN.${N}"
+    elif [ "$tls_cf" = "tcp_only" ] && [ "$tls_gh" = "tcp_only" ]; then
+        CLASS="tls_sni_filter_like"
+        echo -e "  Вывод: ${Y}TCP до сайтов есть, но защищённое соединение (TLS) рвётся на нескольких доменах.${N}"
+        echo -e "  ${D}Возможна TLS/SNI-фильтрация, корпоративный прокси или TLS-инспекция; механизм не доказан${N}"
+        echo -e "  ${D}(по одному клиентскому тесту DPI не доказывается).${N}"
     else
-        echo -e "  Вывод: ${Y}TCP 443 работает, но UDP-рефлекторы не ответили.${N}"
-        echo -e "  ${D}UDP-VPN, скорее всего, не подключится. Попробуй режим TCP 443 / Lightway TCP / OpenVPN TCP.${N}"
+        # TLS ок (или не показателен) → весовая логика UDP (STUN весомее: лучший прокси произвольного UDP).
+        local strong=0 yescount=0
+        [ "$udp_dns"  = "yes" ] && yescount=$((yescount+1))
+        [ "$udp_ntp"  = "yes" ] && yescount=$((yescount+1))
+        [ "$udp_stun" = "yes" ] && yescount=$((yescount+1))
+        { [ "$udp_stun" = "yes" ] || [ "$yescount" -ge 2 ]; } && strong=1
+        if [ "$strong" -eq 1 ]; then
+            CLASS="ok"
+            echo -e "  Вывод: ${G}Общий UDP-выход работает. Полной блокировки UDP не видно.${N}"
+            echo -e "  ${D}Если конкретный VPN всё равно не работает — возможна точечная блокировка${N}"
+            echo -e "  ${D}порта/протокола, MTU или проблема сервера (это отсюда не доказывается).${N}"
+        elif [ "$yescount" -ge 1 ]; then
+            CLASS="udp_partial"
+            echo -e "  Вывод: ${Y}Проходит лишь часть UDP (служебные порты), произвольный UDP отвечает плохо.${N}"
+            echo -e "  ${D}UDP-VPN может не подключаться. Попробуй VPN через TCP 443 / Lightway TCP / OpenVPN TCP.${N}"
+            echo -e "  ${D}Если OpenVPN/WireGuard по UDP не встаёт — возможна фильтрация протокола VPN (vpn_protocol_restricted_like), не доказано.${N}"
+        else
+            CLASS="udp_restricted"
+            echo -e "  Вывод: ${Y}TCP 443 работает, но UDP-рефлекторы не ответили.${N}"
+            echo -e "  ${D}UDP-VPN, скорее всего, не подключится. Попробуй режим TCP 443 / Lightway TCP / OpenVPN TCP.${N}"
+            echo -e "  ${D}Если OpenVPN/WireGuard по UDP не встаёт — возможна фильтрация протокола VPN (vpn_protocol_restricted_like), не доказано.${N}"
+        fi
     fi
+
+    [ -n "$CLASS" ] && echo -e "  ${D}Класс: ${C}${CLASS}${N} ${D}(диагностический тег, вероятностный).${N}"
     echo -e "  ${D}Если VPN всё равно плохой — проверь MTU (netinfo --mtu) и смени сервер/протокол.${N}"
     echo
 }
