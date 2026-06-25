@@ -892,7 +892,7 @@ if check_net; then
     NI_UTUN=$(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep -c '^utun')
     echo
     echo -e "Можно временно прописать рабочие DNS-серверы для текущего подключения:"
-    echo -e "  ${C}${DNS_REPAIR}${N}"
+    echo -e "  ${G}${DNS_REPAIR}${N}"
     echo -e "Будет создан бэкап текущих настроек DNS. Откат: ${Y}sudo fixnet --dns-restore${N}"
     if [ "$NI_VPN" -eq 1 ]; then
         echo
