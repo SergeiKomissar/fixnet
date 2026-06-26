@@ -875,7 +875,7 @@ if [ "$WANT_GEO" -eq 1 ]; then
 fi
 
 # Скорость (приём/передача). Считаем raw байт/с, в обоих видах вывода используем.
-DBPS=""; UBPS=""; SPEED_ERR=""
+DBPS=""; UBPS=""; SPEED_ERR=""; SPEED_SRC=""
 if [ "$WANT_SPEED" -eq 1 ]; then
     ni_step "замер скорости (~5 МБ)"
     if { [ "$NET" -eq 0 ] && [ "$HTTPS_OK" -eq 0 ]; }; then
@@ -883,10 +883,26 @@ if [ "$WANT_SPEED" -eq 1 ]; then
     elif ! command -v curl >/dev/null 2>&1; then
         SPEED_ERR="нет curl"
     else
-        DBPS=$(LC_ALL=C curl -s -o /dev/null -w '%{speed_download}' --max-time 30 \
-            "https://speed.cloudflare.com/__down?bytes=${SPEED_BYTES}" 2>/dev/null)
+        # СКАЧИВАНИЕ: Cloudflare → запасные (CacheFly, OVH) — РАЗНЫЕ CDN, берём ПЕРВЫЙ валидный
+        # (≥0.5 Мбит/с). Закрывает слепое пятно: если один speed-сервер недоступен из этой сети,
+        # пробуем другой, а не врём «0». Бюджет времени ограничен (primary 20с, fallback 12с).
+        # Флаги задаём ЯВНО per-endpoint (не упаковываем в строку) — чтобы не зависеть от
+        # word-splitting (в zsh неквотированная строка не разбивается → ломались бы аргументы).
+        _drng=$((SPEED_BYTES-1))
+        for _lbl in cloudflare cachefly ovh; do
+            case "$_lbl" in
+                cloudflare) DBPS=$(LC_ALL=C curl -s -o /dev/null -w '%{speed_download}' --max-time 20 \
+                                "https://speed.cloudflare.com/__down?bytes=${SPEED_BYTES}" 2>/dev/null) ;;
+                cachefly)   DBPS=$(LC_ALL=C curl -s -o /dev/null -w '%{speed_download}' --max-time 12 -r "0-${_drng}" \
+                                "https://cachefly.cachefly.net/10mb.test" 2>/dev/null) ;;
+                ovh)        DBPS=$(LC_ALL=C curl -s -o /dev/null -w '%{speed_download}' --max-time 12 -r "0-${_drng}" \
+                                "https://proof.ovh.net/files/10Mb.dat" 2>/dev/null) ;;
+            esac
+            if [ -n "$(to_mbps "$DBPS")" ]; then SPEED_SRC="$_lbl"; break; fi
+        done
+        # ОТДАЧА: только Cloudflare (надёжного анонимного POST-приёмника для fallback нет).
         UBPS=$(dd if=/dev/zero bs=1000000 count=$((SPEED_BYTES/1000000)) 2>/dev/null \
-            | LC_ALL=C curl -s -o /dev/null -w '%{speed_upload}' --max-time 30 \
+            | LC_ALL=C curl -s -o /dev/null -w '%{speed_upload}' --max-time 20 \
                 -X POST --data-binary @- "https://speed.cloudflare.com/__up" 2>/dev/null)
     fi
 fi
@@ -1213,6 +1229,7 @@ render_tech() {
             echo -e "  ${D}тест ~$((SPEED_BYTES/1000000)) МБ в каждую сторону${N}"
             print_speed "приём:   " "$DBPS"
             print_speed "передача:" "$UBPS"
+            [ -n "${SPEED_SRC:-}" ] && echo -e "  ${D}сервер скорости: ${SPEED_SRC}$([ "$SPEED_SRC" != cloudflare ] && echo " (запасной)")${N}"
         fi
     fi
     echo
@@ -1316,7 +1333,8 @@ if [ "$DNS" -eq 0 ] && { [ "$NET" -eq 1 ] || [ "$HTTPS_OK" -eq 1 ]; }; then
 fi
 if [ "$WANT_SPEED" -eq 1 ] && [ -z "$SPEED_ERR" ]; then
     if [ -n "$DL_M" ]; then
-        echo -e "     скачивание:      ${G}${DL_M} Мбит/с${N} ${D}— $(speed_word "$DL_M")${N}"
+        _ssrc=""; { [ -n "${SPEED_SRC:-}" ] && [ "${SPEED_SRC}" != cloudflare ]; } && _ssrc=" ${D}(запасной сервер)${N}"
+        echo -e "     скачивание:      ${G}${DL_M} Мбит/с${N} ${D}— $(speed_word "$DL_M")${N}${_ssrc}"
     elif [ "${MAIN_OK:-0}" -eq 1 ]; then
         echo -e "     скачивание:      ${Y}замер не удался${N} ${D}(сервер скорости недоступен из этой сети?)${N}"
     else
