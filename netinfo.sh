@@ -1516,13 +1516,18 @@ interactive_menu() {
     [ "${WIFI:-0}" -eq 1 ] && wopt=" · s — Wi-Fi сети"
     while true; do
         echo
-        printf "  Enter — закрыть · t — детали · a — советы · r — обновить%s%s · i — AI · u — почему ссылка · ? — пояснения: " "$opt" "$wopt"
+        printf "  Enter — закрыть · r — обновить · t — детали · a — советы · ? — пояснения\n"
+        printf "  i — AI · u — почему ссылка · p — сеть TCP/UDP · g — GitHub/RAW · M — MTU%s%s: " "$wopt" "$opt"
         read -r choice || break
         case "$choice" in
             t|T) divider; render_tech ;;
             a|A) divider; render_advice ;;
             s|S) divider; scan_report ;;
             i|I) divider; AI_MODE="all"; AI_LIST=0; ai_report ;;   # по `i` — полный набор (+Gemini+Z.AI)
+            p|P) divider; probe_report ;;        # проверка TCP/UDP-выхода для VPN (Фаза 5/14.1)
+            g|G) divider; probe_mirrors ;;       # доступ к GitHub/RAW/зеркалам (Фаза 16.1)
+            m)   divider; mtu_report ;;          # path MTU (DF-зонд)  [строчная m иногда удобнее]
+            M)   divider; mtu_report ;;          # path MTU (DF-зонд, Фаза 4)
             u|U) divider; printf "  Вставь ссылку (Cmd+V) и Enter: "; read -r _u
                  _u=$(printf '%s' "${_u:-}" | tr -d '\r\n' | sed 's/^ *//; s/ *$//')
                  if [ -n "$_u" ]; then why_report "$_u"; else echo "  Ссылка не указана."; fi ;;
