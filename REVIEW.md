@@ -550,6 +550,7 @@ print_dns_repair() {
         echo -e "  ${Y}В Wi-Fi вручную прописан локальный DNS ${MDNS_BAD}${N}, но текущая сеть другая (${LOCAL_IP:-?})."
         echo -e "  ${D}Дома он живой, а на раздаче/в отеле мёртвый — поэтому имена сайтов не резолвятся.${N}"
         echo -e "  Корень (вернуть автоматический DNS): ${Y}sudo networksetup -setdnsservers Wi-Fi Empty${N}"
+        echo -e "  ${D}Если этот DNS нужен только дома — после Empty домашний роутер сам раздаст его через DHCP.${N}"
         echo -e "  ${D}Разовый обход (симптом): sudo fixnet --dns${N}"
     else
         echo -e "  Ремонт: ${Y}sudo fixnet --dns${N}"
