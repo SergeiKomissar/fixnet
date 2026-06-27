@@ -1577,23 +1577,28 @@ probe_report() {
 
     # --- Классификация: ОДИН диагностический тег *_like, строго по фактам, вероятностно ---
     if [ "$tcp_base" -eq 0 ]; then
-        # внешний TCP закрыт. Региональные открыты → whitelist_like; всё закрыто → tcp_block_like.
+        # внешний TCP закрыт. РЕГИОНАЛЬНЫЙ КОРПУС (Фаза 16.0): больше контрольных хостов = крепче
+        # сигнал whitelist_like, меньше ложного от одного CDN. Это НЕ обход — только проверка
+        # частичной доступности. Ранний выход при 3 открытых (сильный сигнал — не тратим время).
         local allow_open=0 allow_tested=0 _basis=""
-        for _h in ya.ru vk.com; do
+        for _h in ya.ru vk.com mail.ru rutube.ru gosuslugi.ru; do
             local _r; _r=$(probe_tcp "$_h" 443)
             [ "$_r" = "skip" ] && continue
             allow_tested=$((allow_tested+1))
-            if [ "$_r" = "open" ]; then allow_open=$((allow_open+1)); _basis="${_basis} ${_h} — да;"
-            else _basis="${_basis} ${_h} — нет;"; fi
+            if [ "$_r" = "open" ]; then allow_open=$((allow_open+1)); _basis="${_basis} ${_h}✓"
+            else _basis="${_basis} ${_h}✗"; fi
+            [ "$allow_open" -ge 3 ] && break
         done
         if [ "$allow_tested" -ge 1 ] && [ "$allow_open" -ge 1 ]; then
             CLASS="whitelist_like"
-            if [ "$allow_open" -ge 2 ]; then
+            if [ "$allow_open" -ge 3 ]; then
+                echo -e "  Вывод: ${Y}Похоже на частичную доступность / белый список${N} ${D}(несколько региональных открылись, внешние — нет).${N}"
+            elif [ "$allow_open" -ge 2 ]; then
                 echo -e "  Вывод: ${Y}Похоже на частичную доступность / белый список.${N}"
             else
-                echo -e "  Вывод: ${Y}Возможна частичная доступность, но признак слабый: открылся только один региональный контрольный хост.${N}"
+                echo -e "  Вывод: ${Y}Возможна частичная доступность, но признак слабый: открылся лишь один региональный контрольный хост.${N}"
             fi
-            echo -e "  ${D}Контрольные: внешний IP (1.1.1.1) — нет; внешний домен (apple.com) — нет; региональные:${_basis}${N}"
+            echo -e "  ${D}Контрольные: внешние (1.1.1.1, apple.com) — нет; региональные ${allow_open}/${allow_tested}:${_basis}${N}"
             echo -e "  ${D}Это не похоже на полный обрыв интернета.${N}"
             if [ "${VPN_ACTIVE:-0}" -eq 1 ]; then
                 echo -e "  ${D}VPN активен — причина может быть в VPN-маршруте, split-tunnel или политике VPN-сервера.${N}"
@@ -1602,8 +1607,9 @@ probe_report() {
             fi
         else
             CLASS="tcp_block_like"
-            echo -e "  Вывод: ${Y}TCP 443 наружу не открывается.${N}"
-            echo -e "  ${D}Похоже на отсутствие выхода / портал / фильтрацию связи, а не на DPI. Проверь: netinfo${N}"
+            echo -e "  Вывод: ${Y}Ни внешние, ни региональные контрольные ресурсы не открываются (TCP 443 наружу не идёт).${N}"
+            echo -e "  ${D}Контрольные: внешние (1.1.1.1, apple.com) — нет; региональные ${allow_open}/${allow_tested}:${_basis}${N}"
+            echo -e "  ${D}Не похоже на частичную фильтрацию — скорее базовый обрыв / портал / нет связи. Сначала почини подключение (Wi-Fi/DHCP/DNS): netinfo${N}"
         fi
     elif [ "$tcp_ip" = "open" ] && [ "$tcp_dom" = "closed" ]; then
         CLASS="dns_block_like"
