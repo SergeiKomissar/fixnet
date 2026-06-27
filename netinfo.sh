@@ -389,6 +389,40 @@ except Exception: pass' "$2" <<<"$1" 2>/dev/null
 # (вредная сеть с \033[2J в SSID могла бы чистить экран при echo -e). Плюс trim.
 clean() { printf '%s' "$1" | tr -d '[:cntrl:]' | sed -E 's/^ +| +$//g'; }
 
+# Детектор «ручной приватный DNS на ЧУЖОЙ подсети» (manual_dns_private_mismatch): в сервис
+# Wi-Fi вручную вписан приватный DNS (192.168/10/172.16-31), который НЕ на текущей подсети →
+# дома он живой, на раздаче/в отеле мёртвый → имена не резолвятся. Корневой фикс — вернуть
+# автоматический DNS (Empty), а не разовый fixnet --dns. Возвращает адрес DNS при совпадении.
+wifi_manual_dns_mismatch() {
+    command -v networksetup >/dev/null 2>&1 || return 1
+    local out d dnet lnet
+    out=$(networksetup -getdnsservers Wi-Fi 2>/dev/null)
+    case "$out" in *"aren't any"*|*"not a recognized"*|*Error*) return 1 ;; esac   # автоматический → не наш кейс
+    d=$(printf '%s\n' "$out" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+    [ -z "$d" ] && return 1
+    case "$d" in
+        192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) : ;;   # приватный — наш кейс
+        *) return 1 ;;                                                # публичный (1.1.1.1) — не он
+    esac
+    [ -z "${LOCAL_IP:-}" ] && return 1
+    dnet=$(printf '%s' "$d" | cut -d. -f1-3); lnet=$(printf '%s' "$LOCAL_IP" | cut -d. -f1-3)
+    [ "$dnet" = "$lnet" ] && return 1   # DNS на той же подсети → достижим (дома), не мешает
+    printf '%s' "$d"; return 0          # mismatch: приватный DNS чужой подсети
+}
+
+# Рекомендация ремонта DNS: если поймали manual_dns_private_mismatch (MDNS_BAD) — советуем
+# КОРНЕВОЙ фикс (вернуть автоматический DNS), а fixnet --dns как разовый обход симптома.
+print_dns_repair() {
+    if [ -n "${MDNS_BAD:-}" ]; then
+        echo -e "  ${Y}В Wi-Fi вручную прописан локальный DNS ${MDNS_BAD}${N}, но текущая сеть другая (${LOCAL_IP:-?})."
+        echo -e "  ${D}Дома он живой, а на раздаче/в отеле мёртвый — поэтому имена сайтов не резолвятся.${N}"
+        echo -e "  Корень (вернуть автоматический DNS): ${Y}sudo networksetup -setdnsservers Wi-Fi Empty${N}"
+        echo -e "  ${D}Разовый обход (симптом): sudo fixnet --dns${N}"
+    else
+        echo -e "  Ремонт: ${Y}sudo fixnet --dns${N}"
+    fi
+}
+
 # байт/с -> целые Мбит/с. ПУСТО, если замер не удался ИЛИ результат округляется в 0
 # (<0.5 Мбит/с): «0 Мбит/с» при рабочих сайтах = недостижимый/заблокированный эндпоинт скорости,
 # а не реальная скорость 0 → честнее показать «замер не удался», чем «0 — очень медленно».
@@ -1243,6 +1277,7 @@ echo -e "  Вывод:              ${WORK}"
 # зовём при «UDP-53 мёртв, DoH жив, сайты не открываются»; честно оговариваем, если
 # мёртв и DoH (ремонт может не помочь). DoH-успех НЕ выдаём за «DNS работает».
 if [ "$DNS" -eq 0 ] && [ "${CAPTIVE:-0}" -eq 0 ] && { [ "$NET" -eq 1 ] || [ "$HTTPS_OK" -eq 1 ]; }; then
+    MDNS_BAD=$(wifi_manual_dns_mismatch)   # ручной приватный DNS на чужой подсети? (Empty лечит корень)
     if   [ "$DOH_OK" = "1" ] && [ "$HTTPS_OK" -eq 1 ]; then
         : # ложной тревоги нет — строка «адреса (DNS)» уже сказала «резолв через DoH»; ремонт не нужен
     elif [ "$DOH_OK" = "1" ]; then
@@ -1250,7 +1285,7 @@ if [ "$DNS" -eq 0 ] && [ "${CAPTIVE:-0}" -eq 0 ] && { [ "$NET" -eq 1 ] || [ "$HT
         echo -e "  ${Y}Обычная проверка имён сайтов, вероятно, не работает; защищённая — проходит.${N}"
         [ "${TS_DNS:-0}" -eq 1 ] && \
             echo -e "  ${D}Обнаружен Tailscale DNS — вероятно, не работает upstream DNS текущей сети.${N}"
-        echo -e "  Ремонт: ${Y}sudo fixnet --dns${N}"
+        print_dns_repair
     elif [ "$DOH_OK" = "0" ]; then
         echo
         echo -e "  ${R}Имена сайтов не находятся ни обычным, ни защищённым способом${N} — проблема глубже, ${D}fixnet --dns может не помочь.${N}"
@@ -1259,7 +1294,7 @@ if [ "$DNS" -eq 0 ] && [ "${CAPTIVE:-0}" -eq 0 ] && { [ "$NET" -eq 1 ] || [ "$HT
         echo -e "  ${Y}DNS не работает:${N} интернет по IP есть, но имена сайтов не находятся."
         [ "${TS_DNS:-0}" -eq 1 ] && \
             echo -e "  ${D}Обнаружен Tailscale DNS — вероятно, не работает upstream DNS текущей сети.${N}"
-        echo -e "  Ремонт: ${Y}sudo fixnet --dns${N}"
+        print_dns_repair
     fi
 fi
 
