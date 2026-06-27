@@ -120,6 +120,7 @@ netinfo — осмотр сети macOS
   netinfo --advice     советы по текущей сети
   netinfo --mtu        измерить path MTU (DF-зонд) и дать рекомендацию
   netinfo --probe      проверить TCP/UDP-выход для оценки пригодности VPN-протоколов
+  netinfo --probe-mirrors  доступ к GitHub/RAW/зеркалам (github открыт, а raw — нет?)
   netinfo --scan       показать соседние Wi-Fi сети (read-only, не подключает)
   netinfo --json       машиночитаемый вывод (факты и коды состояний; без рендера)
   netinfo --explain    пояснить термины простым языком (DNS, TLS, 403 и т.п.)
@@ -155,6 +156,7 @@ ADVICE=0        # 1 = показать подробные советы «есл�
 NO_HISTORY=0    # 1 = разовый запуск без записи в историю
 MTU_PROBE=0     # 1 = режим измерения path MTU (медленный DF-зонд)
 PROBE=0         # 1 = проба TCP/UDP-выхода (Фаза 5: оценка ограничений для VPN)
+MIRRORS=0       # 1 = проба доступа к Git/RAW/зеркалам (Фаза 16.1, read-only)
 SCAN=0          # 1 = скан соседних Wi-Fi сетей (Фаза 6: read-only)
 JSON=0          # 1 = машиночитаемый JSON-вывод (Фаза 6.1: стабильный контракт)
 EXPLAIN=0       # 1 = пояснить термины простым языком (Фаза 12; клавиша ? в меню)
@@ -177,6 +179,7 @@ while [ $# -gt 0 ]; do
         --no-history) NO_HISTORY=1 ;;
         --mtu)        MTU_PROBE=1 ;;
         --probe)      PROBE=1 ;;
+        --probe-mirrors) MIRRORS=1 ;;
         --scan)       SCAN=1 ;;
         --json)       JSON=1 ;;
         --explain)    EXPLAIN=1 ;;
@@ -1022,6 +1025,63 @@ org_is_datacenter() {
             return 0 ;;
     esac
     return 1
+}
+
+# Доступ к Git/RAW/зеркалам (Фаза 16.1): read-only. HTTPS range 0-0 (1 байт, файл НЕ качаем),
+# короткий таймаут, приватные URL НЕ логируем, curl|bash НЕ предлагаем. Вывод по НЕСКОЛЬКИМ
+# хостам (не по одному). Самый ценный кейс: github.com открыт, raw.githubusercontent.com — нет.
+probe_mirrors() {
+    echo
+    echo -e "${B}=== ДОСТУП К GIT/RAW/ЗЕРКАЛАМ ===${N}"
+    command -v curl >/dev/null 2>&1 || { echo -e "  ${D}Нужен curl.${N}"; echo; return; }
+    [ -t 1 ] || echo -e "  ${D}Проверяю…${N}"
+    nl_spin_start "проверяю git/raw/зеркала"
+    local github_ok=0 raw_ok=0 mir_ok=0 mir_tot=0 any_ok=0 rows=""
+    local h meta code tcon sw det
+    for h in github.com raw.githubusercontent.com gitlab.com codeberg.org bitbucket.org raw.githack.com; do
+        meta=$(LC_ALL=C curl -sS -o /dev/null -L --range 0-0 --connect-timeout 4 --max-time 8 \
+               -w '%{http_code}\t%{time_connect}' "https://$h/" 2>/dev/null)
+        code=$(printf '%s' "$meta"|cut -f1); tcon=$(printf '%s' "$meta"|cut -f2)
+        if [ -n "$code" ] && [ "$code" != "000" ]; then sw=ok; det="HTTP $code"; any_ok=1
+        elif awk "BEGIN{exit !(($tcon+0)>0)}"; then sw=fail; det="TLS не встал"
+        else sw=fail; det="нет соединения / таймаут"; fi
+        case "$h" in
+            github.com) [ "$sw" = ok ] && github_ok=1 ;;
+            raw.githubusercontent.com) [ "$sw" = ok ] && raw_ok=1 ;;
+            gitlab.com|codeberg.org|bitbucket.org) mir_tot=$((mir_tot+1)); [ "$sw" = ok ] && mir_ok=$((mir_ok+1)) ;;
+        esac
+        rows="${rows}${h}|${sw}|${det}\n"
+    done
+    nl_spin_stop
+    echo
+    printf '%b' "$rows" | while IFS='|' read -r host sw det; do
+        [ -z "$host" ] && continue
+        if [ "$sw" = ok ]; then echo -e "  $(printf '%-26s' "$host") ${G}ok${N}    ${D}${det}${N}"
+        else echo -e "  $(printf '%-26s' "$host") ${R}—${N}     ${D}${det}${N}"; fi
+    done
+    echo
+    local cls=""
+    if   [ "$github_ok" -eq 1 ] && [ "$raw_ok" -eq 0 ]; then cls=github_raw_problem_like
+    elif [ "$github_ok" -eq 0 ] && [ "$mir_ok" -ge 1 ]; then cls=github_fail_mirrors_ok
+    elif [ "$any_ok" -eq 0 ]; then cls=all_fail
+    elif [ "$github_ok" -eq 1 ] && [ "$raw_ok" -eq 1 ] && [ "$mir_ok" -eq "$mir_tot" ]; then cls=mirrors_ok
+    else cls=partial; fi
+    case "$cls" in
+        github_raw_problem_like)
+            echo -e "  Вывод: ${Y}GitHub-сайт открывается, но RAW-доступ (raw.githubusercontent.com) не проходит.${N}"
+            echo -e "  ${D}Это ломает установщики/обновления/curl-скрипты и загрузку raw-файлов.${N}"
+            echo -e "  ${D}Альтернативы: GitLab, Codeberg, Bitbucket, RawGitHack (raw-proxy/CDN, не полноценное зеркало) или VPN.${N}" ;;
+        github_fail_mirrors_ok)
+            echo -e "  Вывод: ${Y}GitHub не проходит, но альтернативные Git-хостинги доступны (GitLab/Codeberg/Bitbucket).${N}" ;;
+        mirrors_ok)
+            echo -e "  Вывод: ${G}все Git/RAW/зеркала доступны.${N}" ;;
+        all_fail)
+            echo -e "  Вывод: ${R}ни один не открывается${N} ${D}— похоже на общий обрыв/фильтрацию. Проверь: netinfo${N}" ;;
+        partial)
+            echo -e "  Вывод: ${Y}доступ частичный (см. таблицу).${N} ${D}Для затронутых хостов/RAW — зеркало или VPN.${N}" ;;
+    esac
+    echo -e "  ${D}Класс: ${cls} (вероятностный). Только доступность endpoint'ов; ничего не качаем и не запускаем.${N}"
+    echo
 }
 
 # Локальные proxy/TUN-клиенты (Фаза 16.2): read-only осмотр. ТОЛЬКО lsof localhost LISTEN на
@@ -2556,6 +2616,7 @@ why_is_file() {
 # Сбор — ОДИН раз; дальше только рендеры. Меню — лишь когда вывод в терминал.
 if [ "$MTU_PROBE" -eq 1 ]; then mtu_report; exit 0; fi
 if [ "$PROBE" -eq 1 ]; then probe_report; exit 0; fi
+if [ "$MIRRORS" -eq 1 ]; then probe_mirrors; exit 0; fi
 if [ "$SCAN" -eq 1 ]; then scan_report; exit 0; fi
 if [ "$AI_FORCE" -eq 1 ]; then ai_report; exit 0; fi
 if [ "$EXPLAIN" -eq 1 ]; then render_explain; exit 0; fi

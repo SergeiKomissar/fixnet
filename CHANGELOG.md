@@ -36,6 +36,14 @@
   на access --matrix. НЕ подключаемся, НЕ меняем, НЕ сканируем сеть. База под 18.0 (external
   transport detection). Идея из vpn-configs-репо (security-блок про незащищённый локальный SOCKS5).
 
+## Фаза 16.1 — netinfo --probe-mirrors (доступ к Git/RAW/зеркалам, read-only)
+- Отдельный режим: github.com / raw.githubusercontent.com / gitlab.com / codeberg.org /
+  bitbucket.org / raw.githack.com. HTTPS range 0-0 (файл не качаем), короткий таймаут, приватные
+  URL не логируем, curl|bash не предлагаем. Вывод по нескольким хостам, не по одному.
+- Классы: mirrors_ok / github_raw_problem_like (github открыт, raw — нет: самый ценный РФ-кейс) /
+  github_fail_mirrors_ok / all_fail / partial. RawGitHack помечен как raw-proxy/CDN, не зеркало.
+- Граница: только доступность endpoint'ов; ничего не качаем, не запускаем, не выбираем обход.
+
 ## Фаза 16.0 — расширенный probe-корпус для whitelist_like (идея из vpn-configs-репо, без конфигов)
 - Региональный контрольный набор расширен с 2 до 5 хостов: ya.ru, vk.com, mail.ru, rutube.ru,
   gosuslugi.ru (больше якорей = крепче сигнал, меньше ложного от одного CDN). Ранний выход при
