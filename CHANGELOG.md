@@ -28,6 +28,14 @@
 - Граунд-факт на машине владельца: авто-переключение НЕДОСТУПНО (коммерческие VPN — GUI,
   Tailscale без exit-node) → access = диагност+советчик. 17.1 (matrix) и 17.2 (switch) — отложены.
 
+## Фаза 16.2 — local proxy / TUN exposure в `--tech` (read-only security)
+- Блок «ЛОКАЛЬНЫЕ ПРОКСИ / TUN-КЛИЕНТЫ»: системный прокси (scutil --proxy) + lsof localhost
+  LISTEN ТОЛЬКО на известных proxy-портах/процессах (Karing/sing-box/Clash/v2ray/xray/…) —
+  системные службы (rapportd/ControlCenter) не дампим. При находке: предупреждение «обнаружен
+  proxy-inbound, авторизацию netinfo не проверяет; защити SOCKS/HTTP или выключи» + указатель
+  на access --matrix. НЕ подключаемся, НЕ меняем, НЕ сканируем сеть. База под 18.0 (external
+  transport detection). Идея из vpn-configs-репо (security-блок про незащищённый локальный SOCKS5).
+
 ## Фаза 16.0 — расширенный probe-корпус для whitelist_like (идея из vpn-configs-репо, без конфигов)
 - Региональный контрольный набор расширен с 2 до 5 хостов: ya.ru, vk.com, mail.ru, rutube.ru,
   gosuslugi.ru (больше якорей = крепче сигнал, меньше ложного от одного CDN). Ранний выход при

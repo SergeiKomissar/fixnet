@@ -1024,6 +1024,42 @@ org_is_datacenter() {
     return 1
 }
 
+# Локальные proxy/TUN-клиенты (Фаза 16.2): read-only осмотр. ТОЛЬКО lsof localhost LISTEN на
+# ИЗВЕСТНЫХ proxy-портах/процессах (системные службы НЕ дампим) + системный прокси (scutil).
+# НЕ подключаемся, НЕ меняем, НЕ сканируем сеть. База под будущий external transport detection.
+local_proxies() {
+    echo
+    echo -e "${B}=== ЛОКАЛЬНЫЕ ПРОКСИ / TUN-КЛИЕНТЫ ===${N}"
+    local sp; sp=$(scutil --proxy 2>/dev/null | awk '/Enable/ && / 1$/' | grep -oE '[A-Za-z]+Enable' | tr '\n' ' ')
+    if [ -n "$sp" ]; then echo -e "  системный прокси: ${Y}включён${N} ${D}(${sp})${N}"
+    else echo -e "  системный прокси: ${G}выключен${N}"; fi
+    local found=0
+    if command -v lsof >/dev/null 2>&1; then
+        local port cmd hint
+        while IFS=$'\t' read -r port cmd; do
+            [ -z "$port" ] && continue
+            hint=""
+            case " 1080 1081 1086 1087 7890 7891 7897 8388 9090 10808 10809 2080 6152 6153 " in *" $port "*) hint="proxy-порт" ;; esac
+            case "$cmd" in *[Kk]aring*|*sing-box*|*singbox*|*clash*|*mihomo*|*[Vv]2ray*|*[Xx]ray*|*[Ss]hadowsocks*|*[Ss]urge*|*[Tt]hrone*|*[Nn]eko*|*hysteria*|*[Mm]ullvad*) hint="proxy-клиент" ;; esac
+            [ -z "$hint" ] && continue
+            [ "$found" -eq 0 ] && echo -e "  ${D}локальные слушатели (proxy-порты/клиенты):${N}"
+            found=1
+            echo -e "    ${C}127.0.0.1:${port}${N}  ${cmd}  ${Y}← ${hint}${N}"
+        done <<EOF
+$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && ($9 ~ /127\.0\.0\.1:/ || $9 ~ /\[::1\]:/ || $9 ~ /\*:/){n=split($9,a,":"); print a[n]"\t"$1}' | sort -u)
+EOF
+    else
+        echo -e "  ${D}lsof недоступен — слушатели не проверены${N}"
+    fi
+    if [ "$found" -eq 1 ]; then
+        echo -e "  ${Y}Обнаружен локальный proxy-inbound.${N} ${D}netinfo НЕ проверяет его авторизацию.${N}"
+        echo -e "  ${D}Если это VPN/proxy-клиент — убедись, что локальный SOCKS/HTTP защищён (auth) или выключен.${N}"
+        echo -e "  ${D}Проверить маршрут через него: access --matrix URL.${N}"
+    else
+        echo -e "  ${D}proxy-слушателей (Karing/sing-box/Clash/…) не обнаружено.${N}"
+    fi
+}
+
 render_tech() {
     render_verdict
     echo -e "${D}Замер: ${STAMP}${N}"
@@ -1069,6 +1105,8 @@ render_tech() {
         echo -e "  ${D}Репутация IP: по факту — если сайты отвечают «you have been blocked»/403, этот IP режут.${N}"
         echo -e "  ${D}Точная blacklist-проверка = платный API + отправка IP третьим; по умолчанию не делаем.${N}"
     fi
+
+    local_proxies   # Фаза 16.2: локальные proxy/TUN-клиенты (read-only)
 
     if [ "$WIFI" -eq 1 ] && { [ -n "$RSSI" ] || [ -n "$BAND" ]; }; then
         echo
