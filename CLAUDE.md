@@ -522,8 +522,9 @@ OpenVPN) vs что ТОЛЬКО GUI (ExpressVPN/HideMyName/NE-VPN из scutil) +
 доступность авто-переключения. СДЕЛАНО 17.1 `access --matrix URL`: текущий маршрут (geo) → `netinfo --why-class` (НОВЫЙ машинный
 выход why: `class<TAB>http_code<TAB>latency_ms`, тихий, без шапки) → запись в access-matrix.jsonl
 НОРМАЛИЗОВАННО (host + url_hash sha256-срез + path_class, БЕЗ полного URL — приватность) → таблица
-истории по host (последний результат на страну) + рекомендация (рабочие/избегать). `access --mark
-ok|fail|browser-ok|region-fail` — РУЧНОЙ исход (app_shell сам не знает, открылось ли в браузере);
+истории по host (последний результат на страну) + рекомендация (рабочие/избегать). `access --mark` — РУЧНОЙ исход (app_shell сам не знает, открылось ли в браузере); СЛОВАРЬ меток
+(17.1.1) фиксирован: browser-ok/region-fail/login-required/cloudflare-fail/ok/fail/unknown, неизвестная
+→ отказ. `access --history [HOST]` — карта без прогона (login-required/unknown нейтральны, не «плохой маршрут»);
 метки ЛИПКИЕ (помеченный исход бьёт поздний немеченый прогон). access НЕ переключает VPN — советует
 выбрать страну вручную. ОТЛОЖЕНО: 17.2 `access --switch` (только Tailscale exit-node/WireGuard, с
 подтверждением; коммерческие GUI — только совет; на этой машине пока нечем).

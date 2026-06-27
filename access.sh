@@ -1,5 +1,5 @@
 #!/bin/bash
-# access.sh — «access router» (Фазы 17.0–17.1). ЧЕТВЁРТЫЙ слой поверх netinfo/why:
+# access.sh — «access router» (Фазы 17.0–17.1.1). ЧЕТВЁРТЫЙ слой поверх netinfo/why:
 #   netinfo — что со связью · fixnet — чинит локальное · why — почему URL не идёт ·
 #   access  — выбирает рабочий ДОВЕРЕННЫЙ маршрут (твои уже настроенные VPN-каналы).
 #
@@ -17,6 +17,9 @@ R=$'\033[0;31m'; G=$'\033[0;32m'; Y=$'\033[0;33m'; B=$'\033[0;34m'; C=$'\033[0;3
 STATE_DIR="$HOME/Library/Application Support/netinfo"
 MATRIX="$STATE_DIR/access-matrix.jsonl"
 ensure_state() { [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR" 2>/dev/null; }
+
+# Допустимые ручные метки исхода (Фаза 17.1.1 — фиксируем словарь, чтобы история не «каша»).
+MARKS="browser-ok region-fail login-required cloudflare-fail ok fail unknown"
 
 country_name() {
     case "$1" in
@@ -56,6 +59,55 @@ path_class() {
     case "$path" in *.pdf|*.zip|*.dmg|*.png|*.jpg|*.jpeg|*.mp4|*.gz|*.tar|*.exe|*.bin|*.iso|*.csv|*.docx|*.xlsx|*.pptx) echo file; return ;; esac
     case "$path" in ""|/) echo root; return ;; esac
     echo app
+}
+
+# Таблица истории по host + рекомендация (общая для --matrix и --history). Маршрутная логика:
+# browser-ok/ok → рабочий; region-fail/cloudflare-fail/fail → избегать; login-required/unknown →
+# нейтрально (это не «плохой маршрут», а свойство ресурса). Метки липкие (помеч. бьёт немеч.).
+print_history() {
+    local host="$1"
+    python3 - "$host" "$MATRIX" <<'PY'
+import json,sys,collections
+host,path=sys.argv[1],sys.argv[2]
+NAME={"AT":"Австрия","BE":"Бельгия","DE":"Германия","NL":"Нидерланды","US":"США","GB":"Британия",
+      "FR":"Франция","FI":"Финляндия","SE":"Швеция","CH":"Швейцария","TR":"Турция","RU":"Россия",
+      "PL":"Польша","ES":"Испания","IT":"Италия","":"?"}
+rows=[]
+try:
+    for ln in open(path):
+        ln=ln.strip()
+        if not ln: continue
+        try: d=json.loads(ln)
+        except: continue
+        if d.get("host")==host: rows.append(d)
+except FileNotFoundError: pass
+g=collections.OrderedDict()
+for d in rows:                                   # rows в хронологическом порядке (как в файле)
+    cc=d.get("route_country",""); cur=g.get(cc)
+    if cur is None: g[cc]=d; continue
+    dn=bool(d.get("user_note")); cn=bool(cur.get("user_note"))
+    if dn or not cn: g[cc]=d                      # помеченный бьёт немеченый; иначе — позднейший
+GOODN={"ok","browser-ok"}; BADN={"fail","region-fail","cloudflare-fail"}   # login-required/unknown → нейтрально
+BADC={"http_forbidden","blockpage","tcp_blocked","dns_problem","slow_or_timeout","server_error","local_network"}
+good=[]; bad=[]; amb=[]
+if not g:
+    print("\n  Истории по этому ресурсу пока нет. Прогони: access --matrix URL"); sys.exit(0)
+print("\n  История по ресурсу (маршрутов: %d):"%len(g))
+for cc,d in g.items():
+    nm=NAME.get(cc,cc) or "?"; c=d.get("class",""); note=d.get("user_note","")
+    print("    %-12s %-18s %s"%(nm+(" VPN" if d.get("vpn_active") else ""), c, ("· "+note) if note else ""))
+    if note in GOODN or (not note and c=="ok"): good.append(nm)
+    elif note in BADN or c in BADC: bad.append(nm)
+    else: amb.append(nm)
+print("\n  Рекомендация:")
+if good: print("    Рабочие маршруты: "+", ".join(dict.fromkeys(good)))
+if bad:  print("    Избегать: "+", ".join(dict.fromkeys(bad)))
+if amb and not good:
+    print("    Пока неясно (%s): отметь руками после проверки в браузере —"%", ".join(dict.fromkeys(amb)))
+    print("      access --mark browser-ok | region-fail | login-required | cloudflare-fail | ok | fail")
+elif amb:
+    print("    Под вопросом (нужна метка): "+", ".join(dict.fromkeys(amb)))
+PY
 }
 
 # ---------- Фаза 17.0: инвентарь ----------
@@ -109,19 +161,16 @@ matrix() {
     echo
     echo -e "${B}=== ACCESS MATRIX ===${N}"
     echo -e "  Ресурс:          ${C}${url}${N}"
-    # текущий маршрут
     local cx cc city org ip extdev vpn=0
     cx=$(current_exit); cc=$(printf '%s' "$cx"|cut -f1); city=$(printf '%s' "$cx"|cut -f2)
     org=$(printf '%s' "$cx"|cut -f3); ip=$(printf '%s' "$cx"|cut -f4)
     extdev=$(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{print $2}'); case "$extdev" in utun*) vpn=1 ;; esac
     echo -e "  Маршрут:         ${C}$(country_name "$cc")${city:+, $city}${N} ${D}· ${org} · ${ip} · VPN $([ $vpn -eq 1 ] && echo активен || echo нет)${N}"
-    # прогон через why (источник правды по слоям)
     local res cls code lat
     res=$(NL_NO_SPINNER=1 "$NI" --why-class "$url" 2>/dev/null | head -1)
     cls=$(printf '%s' "$res"|cut -f1); code=$(printf '%s' "$res"|cut -f2); lat=$(printf '%s' "$res"|cut -f3)
     [ -z "$cls" ] && cls="unknown"
     echo -e "  Проверка:        слой ${C}${cls}${N} ${D}· HTTP ${code:-?} · задержка ${lat:-?} мс${N}"
-    # запись (нормализованно: host + hash, без полного URL)
     local host hash pclass ts
     host=$(printf '%s' "$url" | sed -E 's#^[a-z]+://##; s#@[^/]*##; s#[:/].*$##')
     hash=$(printf '%s' "$url" | shasum -a 256 2>/dev/null | cut -c1-16)
@@ -135,59 +184,48 @@ rec={"ts":a[1],"host":a[2],"url_hash":a[3],"path_class":a[4],"route_country":a[5
      "http_code":int(a[11] or 0),"latency_ms":int(a[12] or 0),"user_note":""}
 open(a[13],"a").write(json.dumps(rec,ensure_ascii=False)+"\n")
 PY
-    # таблица истории + рекомендация по host
-    python3 - "$host" "$MATRIX" <<'PY'
+    print_history "$host"
+    echo
+    echo -e "  ${D}access не переключает VPN — выбери страну вручную в приложении и прогони снова.${N}"
+    echo -e "  ${D}Что реально открылось в браузере, добавь меткой: ${C}access --mark browser-ok${N}${D} (или region-fail/login-required/cloudflare-fail/ok/fail).${N}"
+    echo
+}
+
+# ---------- Фаза 17.1.1: история без нового прогона ----------
+history() {
+    [ -f "$MATRIX" ] || { echo -e "${Y}Истории нет — сначала: access --matrix URL${N}"; return 1; }
+    if [ "$#" -ge 1 ] && [ -n "$1" ]; then
+        echo; echo -e "${B}=== ACCESS HISTORY: ${C}$1${B} ===${N}"
+        print_history "$1"; echo
+    else
+        echo; echo -e "${B}=== ACCESS HISTORY (все ресурсы) ===${N}"
+        python3 - "$MATRIX" <<'PY'
 import json,sys,collections
-host,path=sys.argv[1],sys.argv[2]
-NAME={"AT":"Австрия","BE":"Бельгия","DE":"Германия","NL":"Нидерланды","US":"США","GB":"Британия",
-      "FR":"Франция","FI":"Финляндия","SE":"Швеция","CH":"Швейцария","TR":"Турция","RU":"Россия",
-      "PL":"Польша","ES":"Испания","IT":"Италия","":"?"}
-rows=[]
+c=collections.Counter()
 try:
-    for ln in open(path):
+    for ln in open(sys.argv[1]):
         ln=ln.strip()
         if not ln: continue
         try: d=json.loads(ln)
         except: continue
-        if d.get("host")==host: rows.append(d)
+        c[d.get("host","?")]+=1
 except FileNotFoundError: pass
-g=collections.OrderedDict()
-for d in rows:                                  # rows в хронологическом порядке (как в файле)
-    cc=d.get("route_country",""); cur=g.get(cc)
-    if cur is None: g[cc]=d; continue
-    dn=bool(d.get("user_note")); cn=bool(cur.get("user_note"))
-    if dn or not cn: g[cc]=d                     # помеченный бьёт немеченый; иначе — позднейший
-GOODN={"ok","browser-ok"}; BADN={"fail","region-fail"}
-BADC={"http_forbidden","blockpage","tcp_blocked","dns_problem","slow_or_timeout","server_error","local_network"}
-good=[]; bad=[]; amb=[]
-print("\n  История по ресурсу (маршрутов: %d):"%len(g))
-for cc,d in g.items():
-    nm=NAME.get(cc,cc) or "?"; c=d.get("class",""); note=d.get("user_note","")
-    print("    %-12s %-18s %s"%(nm+(" VPN" if d.get("vpn_active") else ""), c, ("· "+note) if note else ""))
-    if note in GOODN or (not note and c=="ok"): good.append(nm)
-    elif note in BADN or c in BADC: bad.append(nm)
-    else: amb.append(nm)
-print("\n  Рекомендация:")
-if good: print("    Рабочие маршруты: "+", ".join(dict.fromkeys(good)))
-if bad:  print("    Избегать: "+", ".join(dict.fromkeys(bad)))
-if amb and not good:
-    print("    Пока неясно (%s): отметь руками после проверки в браузере —"%", ".join(dict.fromkeys(amb)))
-    print("      access --mark browser-ok | region-fail | ok | fail")
-elif amb:
-    print("    Под вопросом (нужна метка): "+", ".join(dict.fromkeys(amb)))
-if not (good or bad or amb):
-    print("    Истории пока нет. Переключи VPN на другую страну и прогони снова.")
+if not c: print("  пусто — прогони: access --matrix URL")
+else:
+    for h,n in sorted(c.items()): print("  %-32s %d записей"%(h,n))
+    print("\n  Подробно по ресурсу: access --history HOST")
 PY
-    echo
-    echo -e "  ${D}access не переключает VPN — выбери страну вручную в приложении и прогони снова.${N}"
-    echo -e "  ${D}Что реально открылось в браузере, добавь меткой: ${C}access --mark browser-ok${N}${D} (или region-fail/ok/fail).${N}"
-    echo
+        echo
+    fi
 }
 
-# ---------- ручная метка исхода (app_shell сам не знает, открылось ли в браузере) ----------
+# ---------- ручная метка исхода ----------
 mark() {
-    local note="$1"
-    case "$note" in ok|fail|browser-ok|region-fail) : ;; *) echo -e "${Y}Метка: ok | fail | browser-ok | region-fail${N}"; return 2 ;; esac
+    local note="$1" ok=0 m
+    for m in $MARKS; do [ "$note" = "$m" ] && ok=1; done
+    if [ "$ok" -ne 1 ]; then
+        echo -e "${Y}Неизвестная метка «${note}». Допустимые: ${MARKS// /, }.${N}"; return 2
+    fi
     [ -f "$MATRIX" ] || { echo -e "${Y}Истории нет — сначала: access --matrix URL${N}"; return 1; }
     python3 - "$note" "$MATRIX" <<'PY'
 import json,sys
@@ -203,13 +241,16 @@ PY
 
 case "${1:-}" in
     --vpn-inventory) vpn_inventory ;;
-    --matrix)        [ "$#" -ge 2 ] && matrix "$2" || echo "Использование: access --matrix https://URL" ;;
-    --mark)          [ "$#" -ge 2 ] && mark "$2" || echo "Использование: access --mark ok|fail|browser-ok|region-fail" ;;
+    --matrix)        if [ "$#" -ge 2 ]; then matrix "$2"; else echo "Использование: access --matrix https://URL"; fi ;;
+    --history)       history "${2:-}" ;;
+    --mark)          if [ "$#" -ge 2 ]; then mark "$2"; else echo "Использование: access --mark ${MARKS// /|}"; fi ;;
     ""|-h|--help)
         echo "access — выбор рабочего доверенного маршрута (слой поверх netinfo/why), read-only."
         echo "  access --vpn-inventory          чем можно управлять из shell, что лишь диагностировать"
-        echo "  access --matrix https://URL     проверить URL через текущий маршрут + таблица истории + рекомендация"
-        echo "  access --mark browser-ok|...    отметить РЕАЛЬНЫЙ исход последней проверки (видишь глазами в браузере)"
+        echo "  access --matrix https://URL     проверить URL через текущий маршрут + история + рекомендация"
+        echo "  access --history [HOST]          показать накопленную карту (без нового прогона)"
+        echo "  access --mark <метка>            отметить РЕАЛЬНЫЙ исход последней проверки"
+        echo "                                   метки: ${MARKS// /, }"
         echo "  (Фаза 17.2 --switch — позже, только при управляемом канале: Tailscale exit-node/WireGuard)"
         ;;
     *) echo "Неизвестная команда: $1 (см. access --help)" >&2; exit 2 ;;

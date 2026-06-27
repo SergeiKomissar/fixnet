@@ -3,6 +3,14 @@
 Формат: фазы развития «швейцарского ножа» (netinfo наблюдает, fixnet чинит, netlib —
 общий слой). Даты приблизительные; канонический исходник — этот репозиторий.
 
+## Фаза 17.1.1 — валидация меток + access --history
+- Словарь меток зафиксирован: browser-ok / region-fail / login-required / cloudflare-fail /
+  ok / fail / unknown. Неизвестная метка → честный отказ (история не превращается в кашу).
+- `access --history [HOST]`: показать накопленную карту без нового прогона; без HOST — список
+  ресурсов с числом записей. Таблица вынесена в общую print_history (matrix и history делят).
+- Рекомендация: login-required/unknown → нейтрально (не «плохой маршрут»); cloudflare-fail → избегать.
+- Грабли: `[ $# -ge 2 ] && f || echo usage` печатал usage и когда f возвращал не-ноль → if/then.
+
 ## Фаза 17.1 — access --matrix + --mark (советчик маршрутов с памятью)
 - `access --matrix URL`: текущий маршрут → `netinfo --why-class` (новый машинный выход why:
   class/http_code/latency_ms, тихий) → запись в access-matrix.jsonl нормализованно (host +
