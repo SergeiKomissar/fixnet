@@ -519,9 +519,14 @@ exit-node или WireGuard-профили.
 СДЕЛАНО (`access --vpn-inventory`, read-only): текущий выход (страна/org/IP, geo ipinfo) +
 VPN-активность (route на utun) + что УПРАВЛЯЕМО из shell (Tailscale exit-node / WireGuard /
 OpenVPN) vs что ТОЛЬКО GUI (ExpressVPN/HideMyName/NE-VPN из scutil) + честный вывод про
-доступность авто-переключения. ОТЛОЖЕНО: 17.1 `access --matrix URL` (прогон URL через текущий/
-доступные маршруты, классификация через why, таблица «сервис×страна»); 17.2 `access --switch`
-(только Tailscale exit-node/WireGuard, с подтверждением; коммерческие GUI — только совет).
+доступность авто-переключения. СДЕЛАНО 17.1 `access --matrix URL`: текущий маршрут (geo) → `netinfo --why-class` (НОВЫЙ машинный
+выход why: `class<TAB>http_code<TAB>latency_ms`, тихий, без шапки) → запись в access-matrix.jsonl
+НОРМАЛИЗОВАННО (host + url_hash sha256-срез + path_class, БЕЗ полного URL — приватность) → таблица
+истории по host (последний результат на страну) + рекомендация (рабочие/избегать). `access --mark
+ok|fail|browser-ok|region-fail` — РУЧНОЙ исход (app_shell сам не знает, открылось ли в браузере);
+метки ЛИПКИЕ (помеченный исход бьёт поздний немеченый прогон). access НЕ переключает VPN — советует
+выбрать страну вручную. ОТЛОЖЕНО: 17.2 `access --switch` (только Tailscale exit-node/WireGuard, с
+подтверждением; коммерческие GUI — только совет; на этой машине пока нечем).
 
 ## Фаза 15.0 (сделано): эскалация DNS-ремонта в кнопке fixnet
 

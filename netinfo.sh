@@ -159,6 +159,7 @@ SCAN=0          # 1 = скан соседних Wi-Fi сетей (Фаза 6: re
 JSON=0          # 1 = машиночитаемый JSON-вывод (Фаза 6.1: стабильный контракт)
 EXPLAIN=0       # 1 = пояснить термины простым языком (Фаза 12; клавиша ? в меню)
 WHY_URL=""      # непусто = режим --why URL (Фаза 13: на каком слое не открывается ресурс)
+WHY_JSON=0      # 1 = тихий машинный выход «class<TAB>http_code<TAB>latency_ms» (для access --matrix)
 WANT_AI=1       # 0 = не показывать AI-блок в обычном выводе (опт-аут --no-ai)
 AI_FORCE=0      # 1 = режим netinfo --ai (проверить всегда, даже без VPN)
 AI_MODE="default"  # default = OpenAI+Claude; all = + Gemini + Z.AI
@@ -181,6 +182,7 @@ while [ $# -gt 0 ]; do
         --explain)    EXPLAIN=1 ;;
         --why)        if [ "$#" -ge 2 ]; then WHY_URL="$2"; shift; else WHY_URL="-"; fi ;;
         --why=*)      WHY_URL="${1#--why=}" ;;
+        --why-class)  WHY_JSON=1; if [ "$#" -ge 2 ]; then WHY_URL="$2"; shift; else WHY_URL="-"; fi ;;  # машинный режим для access
         --ai)         AI_FORCE=1
                       if [ "$#" -ge 2 ]; then
                           case "$2" in all) AI_MODE="all"; shift ;; list) AI_LIST=1; shift ;; esac
@@ -2243,37 +2245,40 @@ PY
 # отказа, НЕ «причину блокировки»; не пишем «РКН/DPI/госблок».
 why_report() {
     local url="$1"
-    echo
-    echo -e "${B}=== Почему не открывается ресурс ===${N}"
+    local _q=0; [ "${WHY_JSON:-0}" = "1" ] && _q=1   # _q=1 → тихий машинный режим (для access)
+    [ "$_q" -eq 0 ] && { echo; echo -e "${B}=== Почему не открывается ресурс ===${N}"; }
     case "$url" in
         http://*|https://*) : ;;
-        "") echo -e "  ${D}Укажи полный URL: ${C}netinfo --why https://example.com/file${N}"; echo; return ;;
-        *)  echo -e "  ${Y}Нужен полный URL со схемой, напр.: ${C}netinfo --why https://${url}${N}"; echo; return ;;
+        "") [ "$_q" -eq 1 ] && printf 'bad_url\t000\t0\n' || { echo -e "  ${D}Укажи полный URL: ${C}netinfo --why https://example.com/file${N}"; echo; }; return ;;
+        *)  [ "$_q" -eq 1 ] && printf 'bad_url\t000\t0\n' || { echo -e "  ${Y}Нужен полный URL со схемой, напр.: ${C}netinfo --why https://${url}${N}"; echo; }; return ;;
     esac
-    command -v curl >/dev/null 2>&1 || { echo -e "  ${D}Нужен curl.${N}"; echo; return; }
+    command -v curl >/dev/null 2>&1 || { [ "$_q" -eq 1 ] && printf 'no_curl\t000\t0\n' || { echo -e "  ${D}Нужен curl.${N}"; echo; }; return; }
     local scheme host
     scheme="${url%%://*}"
     host=$(printf '%s' "$url" | sed -E 's#^[a-z]+://##; s#@[^/]*##; s#[:/].*$##')
-    echo -e "  Ресурс:             ${C}${url}${N}"
-    echo -e "  Хост:               ${C}${host}${N}"
-    [ "$scheme" = "http" ] && echo -e "  ${Y}Схема: HTTP — соединение не шифруется.${N}"
-    # VPN — контекст (route на utun). + ОТКУДА стучимся (страна выхода): для 403/451
-    # это принципиально — отказ из РФ/КНР и из ЕС значит разное (правка по запросу).
-    local extdev vpn=0
+    if [ "$_q" -eq 0 ]; then
+        echo -e "  Ресурс:             ${C}${url}${N}"
+        echo -e "  Хост:               ${C}${host}${N}"
+        [ "$scheme" = "http" ] && echo -e "  ${Y}Схема: HTTP — соединение не шифруется.${N}"
+    fi
+    # VPN — контекст (route на utun). + ОТКУДА стучимся (страна выхода). В машинном режиме
+    # geo НЕ тянем (access берёт маршрут сам) — экономим запрос и не печатаем шапку.
+    local extdev vpn=0 gjson="" gip="" gcity="" gcc="" gcn=""
     extdev=$(route -n get "$PROBE_IP1" 2>/dev/null | awk '/interface:/{print $2}')
     case "$extdev" in utun*) vpn=1 ;; esac
-    [ "$vpn" -eq 1 ] && echo -e "  VPN:                ${G}активен${N}" \
-                     || echo -e "  VPN:                ${D}не активен — стучимся из своей страны${N}"
-    local gjson gip gcity gcc gcn
-    nl_spin_start "определяю страну выхода"
-    gjson=$(curl -s --connect-timeout 3 --max-time 6 "https://ipinfo.io/json" 2>/dev/null)
-    nl_spin_stop
-    gip=$(clean "$(json_get "$gjson" ip)"); gcity=$(clean "$(json_get "$gjson" city)")
-    gcc=$(clean "$(json_get "$gjson" country)"); gcn=$(country_name "$gcc"); [ -z "$gcn" ] && gcn="$gcc"
-    if [ -n "$gcc" ]; then
-        echo -e "  Откуда стучимся:    ${C}${gcn}${gcity:+, $gcity}${N}${D}  ·  IP ${gip}${N}"
-    else
-        echo -e "  Откуда стучимся:    ${D}страну выхода определить не удалось${N}"
+    if [ "$_q" -eq 0 ]; then
+        [ "$vpn" -eq 1 ] && echo -e "  VPN:                ${G}активен${N}" \
+                         || echo -e "  VPN:                ${D}не активен — стучимся из своей страны${N}"
+        nl_spin_start "определяю страну выхода"
+        gjson=$(curl -s --connect-timeout 3 --max-time 6 "https://ipinfo.io/json" 2>/dev/null)
+        nl_spin_stop
+        gip=$(clean "$(json_get "$gjson" ip)"); gcity=$(clean "$(json_get "$gjson" city)")
+        gcc=$(clean "$(json_get "$gjson" country)"); gcn=$(country_name "$gcc"); [ -z "$gcn" ] && gcn="$gcc"
+        if [ -n "$gcc" ]; then
+            echo -e "  Откуда стучимся:    ${C}${gcn}${gcity:+, $gcity}${N}${D}  ·  IP ${gip}${N}"
+        else
+            echo -e "  Откуда стучимся:    ${D}страну выхода определить не удалось${N}"
+        fi
     fi
 
     nl_spin_start "проверяю ${host}"
@@ -2371,6 +2376,14 @@ why_report() {
         [ "$wclass" = "ok" ] && [ "$is_spa" -eq 1 ] && wclass="app_shell"
     fi
     rm -f "$bf" 2>/dev/null
+
+    # Машинный режим (Фаза 17.1, для access --matrix): только class<TAB>code<TAB>latency_ms,
+    # без человеческого отчёта. why_report остаётся ЕДИНЫМ источником правды по слоям.
+    if [ "${WHY_JSON:-0}" = "1" ]; then
+        local _latms; _latms=$(awk -v t="${tapp:-0}" 'BEGIN{printf "%d", t*1000}')
+        printf '%s\t%s\t%s\n' "${wclass:-unknown}" "${code:-000}" "${_latms:-0}"
+        return
+    fi
 
     # --- Проверки (человеческий послойный срез) ---
     echo
