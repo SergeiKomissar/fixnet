@@ -765,7 +765,7 @@ UTUN=$(ifconfig 2>/dev/null | grep -c '^utun')
 WIFI_WARN=""
 WIFI=0           # 1 — выход через Wi-Fi (влияет на советы про 5 ГГц/роутер)
 SEC_OPEN=0       # 1 — Wi-Fi без пароля (открытая сеть)
-SSID=""; SEC=""  # сброс на случай переката r с Wi-Fi на кабель (идемпотентность)
+SSID=""; SEC=""; SSID_HIDDEN=0  # сброс на случай переката r с Wi-Fi на кабель (идемпотентность)
 # VPN активен, если ВНЕШНИЙ трафик реально уходит в utun. Так ловим И full-tunnel
 # (он зануляет default route), И сплит-дефолт (0.0.0.0/1 + 128.0.0.0/1 — частый
 # трюк OpenVPN/WireGuard/Tailscale, который САМ default route не трогает, поэтому
@@ -789,6 +789,9 @@ if [ "$LINK_TYPE" = "unknown" ] && is_wifi "$IFACE"; then
     WIFI=1
     SUMMARY=$(ipconfig getsummary "$IFACE" 2>/dev/null)
     SSID=$(clean "$(echo "$SUMMARY" | awk -F' SSID : ' '/ SSID : /{print $2; exit}')")
+    # macOS 26/Sequoia ПРЯЧЕТ SSID как «<redacted>» для приложений без доступа к Геолокации —
+    # это ОС, не наш код. Не показываем плейсхолдер как имя; ставим флаг для подсказки.
+    case "$SSID" in "<redacted>"|"<not associated>") SSID_HIDDEN=1; SSID="" ;; esac
     SEC=$(echo "$SUMMARY"  | awk '$1=="Security"{print $3; exit}')
     case "$LOCAL_IP" in 172.20.10.*) IS_HOTSPOT=1 ;; esac   # фикс-подсеть Apple Personal Hotspot
     if [ "$IS_HOTSPOT" -eq 1 ]; then
@@ -1420,6 +1423,7 @@ LINK_BAND=""
 [ "$WIFI" -eq 1 ] && [ -n "$BAND" ] && \
     LINK_BAND=" · $(band_human "$BAND")${CHAN:+, канал ${CHAN}}${CHW:+, ${CHW} МГц}"
 echo -e "  Подключение:        ${C}${CONN}${LINK_BAND}${N}${WIFI_WARN}"
+[ "${SSID_HIDDEN:-0}" -eq 1 ] && echo -e "  ${D}                    имя сети скрыто macOS — дай Геолокацию: Системные настройки → Конфиденциальность → Службы геолокации → Терминал${N}"
 # 5G/LTE с Mac НЕ определяется (для Mac раздача — просто IP-линк). Честная подсказка
 # только при раздаче, чтобы не мозолила глаза в обычном Wi-Fi.
 [ "$IS_HOTSPOT" -eq 1 ] && \
@@ -1994,6 +1998,7 @@ scan_report() {
     local raw; raw=$(LC_ALL=C system_profiler SPAirPortDataType 2>/dev/null)
     nl_spin_stop
     local cur; cur=$(clean "$(ipconfig getsummary "$ifc" 2>/dev/null | awk -F' SSID : ' '/ SSID : /{print $2; exit}')")
+    case "$cur" in "<redacted>") cur="(имя скрыто)" ;; esac   # macOS прячет SSID без Геолокации
     local known; known=$(wifi_known_ssids)   # сохранённые сети (★), root-only; иначе пусто
     # python: парсит соседей + текущий диапазон, ставит saved-флаг, считает дубль-SSID,
     # сортирует по score (диапазон+сигнал+saved−open) — порядок, НЕ оценки в UI.
@@ -2088,9 +2093,10 @@ PY
         echo; return
     fi
     { printf '  '; scol "сеть" 26; scol "сигнал" 10; scol "диапазон/канал" 17; scol "защита" 13; echo "примечание"; }
-    local has_open=0 saw_saved=0
+    local has_open=0 saw_saved=0 redn=0
     while IFS=$'\t' read -r name band chan width sec rssi iscur saved; do
         [ -z "$name" ] || [ "$name" = "-" ] && continue
+        case "$name" in "<redacted>") redn=1; name="(скрыто)" ;; esac   # macOS скрыл имя
         [ "$band" = "-" ] && band=""; [ "$chan" = "-" ] && chan=""; [ "$rssi" = "-" ] && rssi=""
         local bandh; [ -n "$band" ] && bandh=$(band_human "$band") || bandh="?"
         local bc="${bandh}${chan:+ / ${chan}}"
@@ -2111,6 +2117,11 @@ PY
 $data
 EOF
     echo
+    if [ "$redn" -eq 1 ]; then
+        echo -e "  ${Y}Имена сетей скрыты macOS${N} ${D}(приложению не дан доступ к Геолокации). Диапазоны/каналы/сигнал — реальные;${N}"
+        echo -e "  ${D}имена появятся после: Системные настройки → Конфиденциальность и безопасность → Службы геолокации → включить Терминал.${N}"
+        echo
+    fi
     echo -e "  ${D}Подсказки:${N}"
     if [ "$dup" = "1" ]; then
         echo -e "  ${D}  • Вы на 2.4 ГГц, но «${cur}» видна и на 5 ГГц — для VPN/видео 5 ГГц обычно лучше,${N}"
