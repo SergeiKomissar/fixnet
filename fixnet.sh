@@ -71,12 +71,52 @@ fi
 # config (dns_repair_servers), но в первой реализации — фиксированная константа.
 DNS_REPAIR="1.1.1.1 8.8.8.8"
 
+# --- Журнал запусков (для разбора инцидентов постфактум) -----------------------
+# Каждый запуск пишется в отдельный файл: весь вывод (через tee) + СЫРЫЕ снимки
+# состояния сети (маршруты v4/v6, DNS, интерфейсы) ДО и ПОСЛЕ. Это то, чего не
+# хватало: после аварии видно, что БЫЛО с маршрутами/DNS и что СТАЛО. Файлы — в
+# state-каталоге netlib (владелец — реальный пользователь, не root под sudo).
+# Ротация: держим 30 последних. Любой сбой журнала НЕ роняет ремонт (мягко).
+# ⚠ tee делает stdout не-tty → braille-спиннер (nl_spin_ok: -t 1) сам отключится,
+# но остаётся текстовый фолбэк ([ -t 1 ] || echo … на длинных операциях). Подтвер-
+# ждения читаются со stdin ([ -t 0 ]) и tee их не трогает.
+FIXNET_LOG=""
+_ld="$(nl_state_dir)/fixnet-logs"
+if mkdir -p "$_ld" 2>/dev/null; then
+    nl_chown_state 2>/dev/null
+    ls -1t "$_ld"/fixnet-*.log 2>/dev/null | tail -n +31 | while read -r _old; do rm -f "$_old"; done
+    FIXNET_LOG="$_ld/fixnet-$(date +%Y%m%d-%H%M%S)-$$.log"
+    if : > "$FIXNET_LOG" 2>/dev/null; then
+        [ -n "${SUDO_USER:-}" ] && chown "$SUDO_USER":staff "$FIXNET_LOG" 2>/dev/null
+        exec > >(tee -a "$FIXNET_LOG") 2> >(tee -a "$FIXNET_LOG" >&2)
+    else
+        FIXNET_LOG=""
+    fi
+fi
+
+# Сырой снимок сети В ЖУРНАЛ (не на экран). Пишем напрямую в файл (минуя tee), так
+# финальный снимок «после» из cleanup гарантированно ляжет даже при гонке на выходе.
+raw_snapshot() {
+    [ -n "$FIXNET_LOG" ] || return 0
+    {
+        echo "----- СНИМОК (${1:-?}) $(date '+%Y-%m-%d %H:%M:%S') -----"
+        echo "--- route get default ---";     route -n get default 2>&1
+        echo "--- netstat -rn (inet) ---";     netstat -rn -f inet 2>&1 | head -30
+        echo "--- netstat -rn (inet6) ---";    netstat -rn -f inet6 2>&1 | head -30
+        echo "--- ifconfig (кратко) ---";      ifconfig 2>&1 | grep -E '^[a-z]|inet |status'
+        echo "--- scutil --dns (серверы) ---"; scutil --dns 2>&1 | grep -E 'resolver|nameserver' | head -20
+        echo "----- КОНЕЦ СНИМКА (${1:-?}) -----"
+    } >> "$FIXNET_LOG" 2>&1
+}
+raw_snapshot "до"   # снимок входного состояния — для разбора постфактум
+[ -n "$FIXNET_LOG" ] && echo -e "${D}Журнал запуска: ${FIXNET_LOG}${N}"
+
 # Единый cleanup. ВАЖНО: откат DNS/MTU НЕ здесь — он на файле+self-heal (trap не
-# спасает от SIGKILL/ребута). Сюда — только безопасное на любом выходе (спиннер);
-# будущие хуки добавлять СЮДА, не плодя новые trap. EXIT — очистка; INT/TERM —
-# очистка И выход (130), иначе Ctrl-C посреди ремонта не прервёт скрипт. Частичное
-# состояние (например, записан active.json до setMTU) подберёт self-heal.
-cleanup() { nl_spin_stop 2>/dev/null; }
+# спасает от SIGKILL/ребута). Сюда — только безопасное на любом выходе (спиннер +
+# снимок «после»); будущие хуки добавлять СЮДА, не плодя новые trap. EXIT — очистка;
+# INT/TERM — очистка И выход (130), иначе Ctrl-C посреди ремонта не прервёт скрипт.
+# Частичное состояние (например, записан active.json до setMTU) подберёт self-heal.
+cleanup() { nl_spin_stop 2>/dev/null; raw_snapshot "после" 2>/dev/null; }
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
 
