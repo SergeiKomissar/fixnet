@@ -196,9 +196,11 @@ check_dns() {
     local d
     for d in "$PROBE_DNS1" "$PROBE_DNS2"; do
         if command -v dig >/dev/null 2>&1; then
-            # ищем IPv4 (x.x.x.x) или IPv6 (наличие ':') в ответе
-            dig +short +time=3 +tries=1 "$d" 2>/dev/null \
-                | grep -Eq '([0-9]{1,3}\.){3}[0-9]{1,3}|:' && return 0
+            # A и AAAA — ДВУМЯ отдельными запросами (синхронизировано с netinfo:
+            # устойчивее к CNAME-цепочкам в dig +short, где общий regex по одному
+            # запросу мог промахнуться; поймано воркфлоу-регрессией как дрейф копий)
+            dig +short +time=3 +tries=1 A    "$d" 2>/dev/null | grep -Eq '([0-9]{1,3}\.){3}[0-9]{1,3}' && return 0
+            dig +short +time=3 +tries=1 AAAA "$d" 2>/dev/null | grep -q ':' && return 0
         elif command -v nslookup >/dev/null 2>&1; then
             nslookup -timeout=3 "$d" >/dev/null 2>&1 && return 0
         elif command -v host >/dev/null 2>&1; then
