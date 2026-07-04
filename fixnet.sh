@@ -27,8 +27,8 @@
 #   - не удаляет и не выключает VPN-клиенты;
 #   - не выгружает NetworkExtension;
 #   - не удаляет сами utun-интерфейсы;
-#   - не меняет DNS-серверы БЕЗ спроса (только режим --dns: с бэкапом и откатом);
-#   - не трогает Tailscale (не вызывает tailscale CLI, его настройки не меняет);
+#   - не меняет DNS-серверы;
+#   - не трогает Tailscale;
 #   - не делает глобальный сброс IPv6 (это рвало бы рабочий VPN).
 #
 # Он лишь восстанавливает нормальную маршрутизацию и DHCP, оставляя сетевое
@@ -42,43 +42,58 @@
 #   sudo ./fixnet.sh        # диагностика + починка (нужен пароль)
 #   ./fixnet.sh --check     # только посмотреть состояние, ничего не менять
 #
-#   sudo ./fixnet.sh --dns          # аварийная подмена DNS (бэкап + проверка + откат)
-#   sudo ./fixnet.sh --dns-restore  # вернуть исходный DNS
-#   ./fixnet.sh --dns-status        # показать активную подмену (без root)
-#
-#   sudo ./fixnet.sh --wifi-reset   # передёрнуть Wi-Fi (off/on + DHCP) при залипшей сессии
-#   sudo ./fixnet.sh --reassoc      # то же самое (короткий технический алиас)
-#
 
 set -u
 
-# Цвета для читаемости вывода (красный/зелёный/жёлтый/синий/сброс).
-R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'; B='\033[0;34m'; D='\033[2m'; N='\033[0m'
+# ---------------------------------------------------------------------------
+# ЖУРНАЛ. Каждый запуск пишет полный протокол в ~/.fixnet/log/ — и то, что
+# видит пользователь, и сырые снимки состояния сети (маршруты, DNS-конфиг).
+#
+# Зачем: боевые обрывы редки и невоспроизводимы. Когда кнопка поведёт себя
+# странно, вместо «что-то было не так» будет файл с фактами. Журнал пишется
+# ВСЕГДА (не по флагу): в момент реального инцидента флага под рукой не будет.
+# Храним последние 30 запусков, старые удаляются сами.
+# ---------------------------------------------------------------------------
+LOG_DIR="$HOME/.fixnet/log"
+# при запуске под sudo пишем в домашнюю папку пользователя, а не root
+if [ -n "${SUDO_USER:-}" ]; then
+    LOG_DIR="$(eval echo "~$SUDO_USER")/.fixnet/log"
+fi
+mkdir -p "$LOG_DIR" 2>/dev/null
+LOG_FILE="$LOG_DIR/fixnet-$(date +%Y%m%d-%H%M%S).log"
 
-# Общий слой состояния (бэкап DNS, владелец файлов). Для РЕМОНТА он ОБЯЗАТЕЛЕН:
-# без него нет надёжного отката, поэтому при отсутствии — ОТКАЗ (в отличие от
-# netinfo, который мягко деградирует). Подключаем рядом со скриптом или из ~/bin.
-NL_OK=0
-for _c in "$(dirname "${BASH_SOURCE[0]:-$0}")/netlib.sh" "$HOME/bin/netlib.sh"; do
-    [ -r "$_c" ] && { . "$_c"; NL_OK=1; break; }
+# Ротация: оставляем 30 свежих файлов, остальные тихо удаляем.
+ls -1t "$LOG_DIR"/fixnet-*.log 2>/dev/null | tail -n +31 | while read -r old; do
+    rm -f "$old"
 done
-if [ "$NL_OK" -ne 1 ]; then
-    echo -e "${R}netlib.sh не найден.${N} Без общего state-слоя ремонт небезопасен (нет отката). Отказ." >&2
-    exit 1
+
+# Весь вывод скрипта (stdout и stderr) дублируется в лог-файл через tee.
+# Если tee/каталог недоступны — работаем без журнала, это не повод падать.
+if touch "$LOG_FILE" 2>/dev/null; then
+    exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
+    [ -n "${SUDO_USER:-}" ] && chown "$SUDO_USER" "$LOG_FILE" 2>/dev/null
 fi
 
-# DNS-серверы для аварийной подмены (Cloudflare + Google). Позже можно вынести в
-# config (dns_repair_servers), но в первой реализации — фиксированная константа.
-DNS_REPAIR="1.1.1.1 8.8.8.8"
+# Сырой снимок состояния сети — в лог, но не на экран. Это данные для разбора
+# постфактум: полная таблица маршрутов, DNS-конфигурация, список интерфейсов.
+raw_snapshot() {
+    {
+        echo "----- RAW SNAPSHOT $(date '+%Y-%m-%d %H:%M:%S') -----"
+        echo "--- route get default ---";    route -n get default 2>&1
+        echo "--- netstat -rn (v4) ---";     netstat -rn -f inet 2>&1 | head -25
+        echo "--- netstat -rn (v6) ---";     netstat -rn -f inet6 2>&1 | head -25
+        echo "--- ifconfig (кратко) ---";    ifconfig 2>&1 | grep -E '^[a-z]|inet |status'
+        echo "--- scutil --dns (серверы) ---"; scutil --dns 2>&1 | grep -E 'resolver|nameserver' | head -15
+        echo "----- END SNAPSHOT -----"
+    } >> "$LOG_FILE" 2>/dev/null
+}
 
-# Единый cleanup. ВАЖНО: откат DNS/MTU НЕ здесь — он на файле+self-heal (trap не
-# спасает от SIGKILL/ребута). Сюда — только безопасное на любом выходе (спиннер);
-# будущие хуки добавлять СЮДА, не плодя новые trap. EXIT — очистка; INT/TERM —
-# очистка И выход (130), иначе Ctrl-C посреди ремонта не прервёт скрипт. Частичное
-# состояние (например, записан active.json до setMTU) подберёт self-heal.
-cleanup() { nl_spin_stop 2>/dev/null; }
-trap cleanup EXIT
-trap 'cleanup; exit 130' INT TERM
+# Снимок «после» — при любом исходе (успех/неудача/любая ветка выхода):
+# trap на EXIT гарантирует, что финальное состояние сети попадёт в журнал.
+trap raw_snapshot EXIT
+
+# Цвета для читаемости вывода (красный/зелёный/жёлтый/синий/сброс).
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'; B='\033[0;34m'; N='\033[0m'
 
 # Два внешних адреса для проверки "есть ли интернет". Два — на случай, если
 # конкретная сеть блокирует один из них (тогда один IP дал бы ложную аварию).
@@ -190,15 +205,6 @@ wait_net() {
     return 1
 }
 
-# wait_net со спиннером (чтобы ожидание не выглядело зависанием). Возвращает код
-# wait_net без изменений — можно подставлять прямо в `if`.
-wait_net_spin() {
-    nl_spin_start "${2:-жду восстановления связи}"
-    wait_net "$1"; local rc=$?
-    nl_spin_stop
-    return $rc
-}
-
 # Печатает понятный снимок состояния сети: куда идёт трафик, сколько VPN-туннелей
 # висит, работают ли интернет и DNS. Используется и в режиме --check, и после починки.
 diagnose() {
@@ -217,16 +223,12 @@ diagnose() {
         echo -e "  default-маршрут: ${R}ОТСУТСТВУЕТ (not in table)${N}"
     fi
 
-    # Пороги общие из netlib (NL_UTUN_*) — синхронно с netinfo (раньше fixnet ругался
-    # на ≥3, давая ложную тревогу: macOS штатно держит 3-4 системных туннеля).
     local utun_cnt
     utun_cnt=$(ifconfig 2>/dev/null | grep -c '^utun')
-    if [ "$utun_cnt" -le "${NL_UTUN_NORM:-4}" ]; then
+    if [ "$utun_cnt" -le 2 ]; then
         echo -e "  utun-интерфейсов: ${G}${utun_cnt}${N} (норма)"
-    elif [ "$utun_cnt" -lt "${NL_UTUN_LOTS:-12}" ]; then
-        echo -e "  utun-интерфейсов: ${Y}${utun_cnt}${N} (много VPN/Network Extension туннелей; возможны старые следы)"
     else
-        echo -e "  utun-интерфейсов: ${Y}${utun_cnt}${N} (очень много; при обрывах закрой VPN-клиенты/перезагрузи)"
+        echo -e "  utun-интерфейсов: ${Y}${utun_cnt}${N} (утечка — мёртвые VPN-расширения; см. примечание ниже)"
     fi
 
     local v6def
@@ -252,483 +254,6 @@ need_root() {
         echo -e "${R}Для починки нужен sudo.${N} Запусти:  ${Y}sudo $0${N}"
         exit 1
     fi
-}
-
-# ====================== DNS-РЕМОНТ (--dns) ======================
-# Контракт: netinfo только ДИАГНОСТИРУЕТ «DNS мёртв» и печатает «sudo fixnet --dns».
-# Меняет DNS ТОЛЬКО fixnet — с бэкапом (active.json), проверкой закрепления через
-# networksetup и откатом (--dns-restore / self-heal). Tailscale не трогаем.
-
-# Имя сервиса текущего uplink (через netlib).
-dns_service() { nl_service_for_device "$(detect_iface)"; }
-
-# Прочитать DNS сервиса. Печатает "mode|ip1 ip2 ...": mode=manual|empty.
-# ВАЖНО: источник для бэкапа — networksetup (конфиг сервиса, что и восстановим),
-# а НЕ scutil (тот показывает эффективные резолверы, включая инъекции Tailscale).
-dns_read_service() {
-    local out; out=$(networksetup -getdnsservers "$1" 2>/dev/null)
-    case "$out" in
-        *"any DNS Servers"*|"") echo "empty|" ;;
-        *) echo "manual|$(echo "$out" | tr '\n' ' ' | sed -E 's/ +$//')" ;;
-    esac
-}
-
-# Активен ли Tailscale DNS (по эффективным резолверам scutil) — для информсообщения.
-dns_tailscale_active() {
-    scutil --dns 2>/dev/null | grep -qE '100\.100\.100\.100|fd7a:115c:a1e0'
-}
-
-# Достать поле из active.json (списки печатаются через пробел).
-dns_active_field() {
-    local ap; ap=$(nl_dns_active_path); [ -f "$ap" ] || { echo ""; return; }
-    NL_AP="$ap" FX_KEY="$1" python3 -c '
-import os,json,sys
-try: o=json.load(open(os.environ["NL_AP"]))
-except Exception: sys.exit(0)
-v=o.get(os.environ["FX_KEY"],"")
-print(" ".join(v) if isinstance(v,list) else v)
-' 2>/dev/null
-}
-
-# Записать active.json (атомарно, владельцу через netlib). python3 обязателен.
-dns_write_active() {
-    nl_ensure_dns_dir
-    local ap; ap=$(nl_dns_active_path)
-    FX_SVC="$1" FX_DEV="$2" FX_OMODE="$3" FX_ODNS="$4" FX_NDNS="$5" FX_REASON="$6" \
-    FX_TS="$(date '+%Y-%m-%dT%H:%M:%S%z')" python3 -c '
-import os,json
-o={"schema":1,"ts":os.environ["FX_TS"],"service":os.environ["FX_SVC"],
-   "device":os.environ["FX_DEV"],"old_dns_mode":os.environ["FX_OMODE"],
-   "old_dns":os.environ["FX_ODNS"].split(),"new_dns":os.environ["FX_NDNS"].split(),
-   "reason":os.environ["FX_REASON"],"status":"active","created_by":"fixnet --dns"}
-print(json.dumps(o,ensure_ascii=False,indent=2))
-' > "$ap.tmp" 2>/dev/null && mv "$ap.tmp" "$ap"
-    nl_chown_state
-}
-
-# Закрыть операцию в журнале (applied/restored/superseded) — снимок active.json + статус.
-dns_ops_log() {
-    local ap; ap=$(nl_dns_active_path); [ -f "$ap" ] || return 0
-    nl_ensure_dns_dir
-    NL_AP="$ap" FX_ST="$1" FX_TS="$(date '+%Y-%m-%dT%H:%M:%S%z')" python3 -c '
-import os,json,sys
-try: o=json.load(open(os.environ["NL_AP"]))
-except Exception: sys.exit(0)
-o["status"]=os.environ["FX_ST"]; o["closed_ts"]=os.environ["FX_TS"]
-print(json.dumps(o,ensure_ascii=False))
-' >> "$(nl_dns_ops_log)" 2>/dev/null
-    nl_chown_state
-}
-
-# Откат: вернуть исходный DNS из active.json. empty -> Empty, manual -> список.
-dns_restore() {
-    local ap; ap=$(nl_dns_active_path)
-    [ -f "$ap" ] || { echo "Активной подмены DNS нет — откатывать нечего."; return 0; }
-    local svc mode odns
-    svc=$(dns_active_field service); mode=$(dns_active_field old_dns_mode); odns=$(dns_active_field old_dns)
-    [ -z "$svc" ] && { echo -e "${R}Битый active.json — не могу определить сервис.${N}"; return 1; }
-    if [ "$mode" = "empty" ]; then
-        networksetup -setdnsservers "$svc" Empty
-        echo -e "${G}DNS сервиса «${svc}» возвращён в автоматический (DHCP).${N}"
-    else
-        networksetup -setdnsservers "$svc" $odns
-        echo -e "${G}DNS сервиса «${svc}» возвращён: ${odns}${N}"
-    fi
-    dscacheutil -flushcache 2>/dev/null
-    killall -HUP mDNSResponder 2>/dev/null
-    dns_ops_log restored
-    rm -f "$ap"; nl_chown_state
-}
-
-# Self-heal: в начале запуска заметить ЗАБЫТУЮ подмену и предложить вернуть, либо
-# (если DNS уже сменился) пометить superseded. Безопасно без root (тогда только
-# сообщает). Гарантия отката — этот файл+self-heal, а не trap.
-# Возраст бэкапа в секундах из ISO-ts (или "" если нет python3/не распарсилось).
-dns_backup_age_secs() {
-    command -v python3 >/dev/null 2>&1 || { echo ""; return; }
-    [ -n "$1" ] || { echo ""; return; }
-    FX_TS="$1" python3 - <<'PY' 2>/dev/null
-import os, datetime
-ts=os.environ.get("FX_TS","")
-try:
-    t=datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
-    now=datetime.datetime.now(t.tzinfo)
-    s=int((now-t).total_seconds()); print(s if s>=0 else 0)
-except Exception:
-    pass
-PY
-}
-
-dns_selfheal() {
-    local ap; ap=$(nl_dns_active_path); [ -f "$ap" ] || return 0
-    local svc cur; svc=$(dns_active_field service)
-    cur=$(dns_read_service "$svc"); cur=" ${cur#*|} "
-    if echo "$cur" | grep -q " 1.1.1.1 "; then
-        # Возраст бэкапа управляет ДЕФОЛТОМ вопроса: свежий (<6 ч) — [Y/n] (вернуть),
-        # старый — [y/N] (по умолчанию НЕ трогать, текущее состояние может быть рабочим).
-        local ts age agestr fresh=0
-        ts=$(dns_active_field ts); age=$(dns_backup_age_secs "$ts")
-        if [ -n "$age" ]; then
-            if   [ "$age" -lt 3600 ];  then agestr="возраст меньше часа"
-            elif [ "$age" -lt 86400 ]; then agestr="возраст ~$((age/3600)) ч"
-            else                            agestr="возраст ~$((age/86400)) дн"; fi
-            [ "$age" -lt 21600 ] && fresh=1
-        else
-            agestr="возраст неизвестен"
-        fi
-        echo -e "${Y}Найдена активная подмена DNS (fixnet, ${ts}; ${agestr}) на «${svc}».${N}"
-        if [ "$(id -u)" -eq 0 ] && [ "${ASSUME_YES:-0}" -ne 1 ] && [ -t 0 ]; then
-            if [ "$fresh" -eq 1 ]; then
-                printf "Вернуть исходные DNS сейчас? [Y/n] "; read -r _a
-                case "$_a" in n|N|нет) : ;; *) dns_restore ;; esac
-            else
-                printf "Вернуть исходные DNS сейчас? [y/N] "; read -r _a
-                case "$_a" in y|Y|да) dns_restore ;; *) : ;; esac
-            fi
-        elif [ "$(id -u)" -eq 0 ] && [ "${ASSUME_YES:-0}" -eq 1 ]; then
-            # --yes НЕ восстанавливает прошлый бэкап автоматически: это не запрошенное
-            # действие, а текущее состояние сети может быть рабочим. Откат — только явным
-            # --dns-restore.
-            echo -e "  ${D}--yes не трогает прошлый бэкап. Откат — вручную: ${Y}sudo fixnet --dns-restore${N}"
-        elif [ "$(id -u)" -ne 0 ]; then
-            echo -e "  Верни: ${Y}sudo fixnet --dns-restore${N}"
-        fi
-    else
-        # DNS уже другой (сменили вручную/DHCP/Tailscale) — операция неактуальна.
-        if [ "$(id -u)" -eq 0 ]; then
-            dns_ops_log superseded; rm -f "$ap"; nl_chown_state
-            echo -e "${Y}Прошлая подмена DNS уже неактуальна (DNS сменился) — отметка снята.${N}"
-        fi
-    fi
-}
-
-# Показать статус активной подмены (read-only, root не нужен).
-dns_status() {
-    local ap; ap=$(nl_dns_active_path)
-    if [ -f "$ap" ]; then
-        echo -e "${B}Активная подмена DNS:${N}"
-        echo "  сервис:    $(dns_active_field service) ($(dns_active_field device))"
-        echo "  поставлена:$(dns_active_field ts)"
-        echo "  было:      $(dns_active_field old_dns_mode) [$(dns_active_field old_dns)]"
-        echo "  стало:     $(dns_active_field new_dns)"
-        echo -e "  вернуть:   ${Y}sudo fixnet --dns-restore${N}"
-    else
-        echo "Активной подмены DNS нет."
-    fi
-}
-
-# Зависимости РЕМОНТА (DNS/MTU): python3 — для безопасного бэкапа active.json,
-# networksetup — для самой правки. Проверяем РАНО (до подтверждения), чтобы пользователь
-# не соглашался на ремонт ради отказа на полпути. $1 — что чиним (для текста).
-require_repair_deps() {
-    command -v python3 >/dev/null 2>&1 || { echo -e "${R}Нужен python3 для безопасного бэкапа ${1} — отказ (ремонт без отката запрещён).${N}"; exit 1; }
-    command -v networksetup >/dev/null 2>&1 || { echo -e "${R}Нужен networksetup для правки ${1} — отказ.${N}"; exit 1; }
-}
-
-# Применить аварийный DNS: бэкап -> setdnsservers -> flush -> проверка закрепления
-# (через networksetup!) -> проверка резолва. Провал резолва -> авто-откат.
-dns_apply() {
-    require_repair_deps "DNS"
-    # Уже есть активная подмена? Здесь — БЕЗ интерактивного «вернуть?» (этот вопрос
-    # принадлежит обычному fixnet/self-heal). Логика --dns:
-    #   подмена ВСЁ ЕЩЁ в силе (DNS == наш) → ОТКАЗ (не перетираем backup);
-    #   подмена устарела (DNS уже другой)   → пометить superseded и продолжить.
-    local ap; ap=$(nl_dns_active_path)
-    if [ -f "$ap" ]; then
-        local achk; achk=$(dns_read_service "$(dns_active_field service)"); achk=" ${achk#*|} "
-        if echo "$achk" | grep -q " 1.1.1.1 "; then
-            echo -e "${Y}Уже есть активная DNS-подмена fixnet.${N} Сначала верни её: ${Y}sudo fixnet --dns-restore${N}"
-            exit 0
-        else
-            dns_ops_log superseded; rm -f "$ap"; nl_chown_state
-            echo -e "${Y}Прошлая подмена DNS уже неактуальна (DNS сменился) — отметка снята.${N}"
-        fi
-    fi
-    local dev svc cur mode odns after
-    dev=$(detect_iface); svc=$(dns_service)
-    [ -z "$svc" ] && { echo -e "${R}Не нашёл сетевой сервис для ${dev} — DNS не трогаю.${N}"; exit 1; }
-    cur=$(dns_read_service "$svc"); mode="${cur%%|*}"; odns="${cur#*|}"
-
-    echo -e "${B}>>> Ремонт DNS на сервисе «${svc}» (${dev})${N}"
-    echo -e "  текущий DNS: ${odns:-(автоматический/DHCP)}  [режим: ${mode}]"
-    echo -e "  новый DNS:   ${DNS_REPAIR}"
-    if dns_tailscale_active; then
-        echo
-        echo -e "${Y}Обнаружен Tailscale DNS.${N}"
-        echo -e "  fixnet меняет DNS сервиса Wi-Fi (upstream для обычных сайтов) — настройки Tailscale не трогает."
-        echo -e "  tailnet/MagicDNS-имена обычно не затрагиваются."
-    fi
-    if [ "${ASSUME_YES:-0}" -ne 1 ] && [ -t 0 ]; then
-        printf "Продолжить? [Y/n] "; read -r _a
-        case "$_a" in n|N|нет) echo "Отменено."; exit 0 ;; esac
-    fi
-
-    dns_write_active "$svc" "$dev" "$mode" "$odns" "$DNS_REPAIR" "dns_dead"
-    networksetup -setdnsservers "$svc" $DNS_REPAIR
-    dscacheutil -flushcache 2>/dev/null
-    killall -HUP mDNSResponder 2>/dev/null
-    sleep 1
-
-    # Закрепился ли DNS на СЕРВИСЕ (networksetup, не scutil — scutil при Tailscale
-    # законно покажет 100.100.100.100, это НЕ провал).
-    after=$(dns_read_service "$svc")
-    if ! echo " ${after#*|} " | grep -q " 1.1.1.1 "; then
-        echo -e "${Y}DNS сервиса не закрепился: система/VPN/Tailscale изменили DNS после ремонта.${N}"
-        echo -e "  fixnet не трогает Tailscale. Проверь DNS/upstream в клиенте Tailscale или временно отключи MagicDNS."
-        exit 1   # active.json останется; self-heal при следующем запуске пометит superseded
-    fi
-
-    if check_dns; then
-        echo -e "${G}DNS-серверы временно заменены на ${DNS_REPAIR}.${N}"
-        echo -e "  ${G}Проверка DNS: OK — имена резолвятся.${N}"
-        echo -e "  Откат: ${Y}sudo fixnet --dns-restore${N}"
-        dns_ops_log applied
-        exit 0
-    else
-        echo -e "${Y}DNS после замены всё ещё не работает — восстанавливаю исходные настройки из бэкапа.${N}"
-        dns_restore
-        echo -e "  ${D}Вероятно, проблема глубже: VPN/Network Extension, роутер, captive portal или сетевой стек.${N}"
-        echo -e "  ${D}Закрой VPN-клиенты и перезагрузи Mac.${N}"
-        exit 1
-    fi
-}
-
-# ====================== MTU-РЕМОНТ (--mtu) ======================
-# PMTU-blackhole: сеть молча режет крупные DF-пакеты (path MTU < MTU интерфейса).
-# netinfo --mtu измеряет; здесь — понижение MTU интерфейса до пути, с бэкапом/
-# откатом/self-heal/guard (как --dns). networksetup -setMTU ПЕРСИСТЕНТЕН → на другой
-# сети правка может стать неуместной, поэтому бэкап обязателен. Tailscale не трогаем.
-MTU_MIN=1280; MTU_MAX=1500
-
-# Текущий MTU интерфейса (Current Setting; фолбэк ifconfig).
-mtu_current() {
-    local v; v=$(networksetup -getMTU "$1" 2>/dev/null | sed -nE 's/.*Current Setting: ([0-9]+).*/\1/p')
-    [ -z "$v" ] && v=$(ifconfig "$1" 2>/dev/null | grep -o 'mtu [0-9]*' | awk '{print $2}')
-    echo "$v"
-}
-
-mtu_active_field() {
-    local ap; ap=$(nl_mtu_active_path); [ -f "$ap" ] || { echo ""; return; }
-    NL_AP="$ap" FX_KEY="$1" python3 -c '
-import os,json,sys
-try: o=json.load(open(os.environ["NL_AP"]))
-except Exception: sys.exit(0)
-v=o.get(os.environ["FX_KEY"],"")
-print(" ".join(map(str,v)) if isinstance(v,list) else v)
-' 2>/dev/null
-}
-
-mtu_write_active() {
-    nl_ensure_mtu_dir
-    local ap; ap=$(nl_mtu_active_path)
-    FX_SVC="$1" FX_DEV="$2" FX_OLD="$3" FX_NEW="$4" FX_PATH="$5" \
-    FX_TS="$(date '+%Y-%m-%dT%H:%M:%S%z')" python3 -c '
-import os,json
-o={"schema":1,"ts":os.environ["FX_TS"],"service":os.environ["FX_SVC"],
-   "device":os.environ["FX_DEV"],"old_mtu":int(os.environ["FX_OLD"]),
-   "new_mtu":int(os.environ["FX_NEW"]),"path_mtu":int(os.environ["FX_PATH"]),
-   "anchors":["1.1.1.1","8.8.8.8"],"status":"active","created_by":"fixnet --mtu"}
-print(json.dumps(o,ensure_ascii=False,indent=2))
-' > "$ap.tmp" 2>/dev/null && mv "$ap.tmp" "$ap"
-    nl_chown_state
-}
-
-mtu_ops_log() {
-    local ap; ap=$(nl_mtu_active_path); [ -f "$ap" ] || return 0
-    nl_ensure_mtu_dir
-    NL_AP="$ap" FX_ST="$1" FX_TS="$(date '+%Y-%m-%dT%H:%M:%S%z')" python3 -c '
-import os,json,sys
-try: o=json.load(open(os.environ["NL_AP"]))
-except Exception: sys.exit(0)
-o["status"]=os.environ["FX_ST"]; o["closed_ts"]=os.environ["FX_TS"]
-print(json.dumps(o,ensure_ascii=False))
-' >> "$(nl_mtu_ops_log)" 2>/dev/null
-    nl_chown_state
-}
-
-mtu_restore() {
-    local ap; ap=$(nl_mtu_active_path)
-    [ -f "$ap" ] || { echo "Активной правки MTU нет — откатывать нечего."; return 0; }
-    local dev old; dev=$(mtu_active_field device); old=$(mtu_active_field old_mtu)
-    { [ -z "$dev" ] || [ -z "$old" ]; } && { echo -e "${R}Битый active.json (MTU).${N}"; return 1; }
-    networksetup -setMTU "$dev" "$old"
-    echo -e "${G}MTU интерфейса «${dev}» возвращён: ${old}.${N}"
-    mtu_ops_log restored
-    rm -f "$ap"; nl_chown_state
-}
-
-mtu_selfheal() {
-    local ap; ap=$(nl_mtu_active_path); [ -f "$ap" ] || return 0
-    local dev new cur; dev=$(mtu_active_field device); new=$(mtu_active_field new_mtu)
-    cur=$(mtu_current "$dev")
-    if [ "$cur" = "$new" ]; then
-        echo -e "${Y}Найдена активная правка MTU (fixnet, $(mtu_active_field ts)): ${dev} MTU=${new}.${N}"
-        if [ "$(id -u)" -eq 0 ] && [ -t 0 ]; then
-            printf "Вернуть MTU %s? [Y/n] " "$(mtu_active_field old_mtu)"; read -r _a
-            case "$_a" in n|N|нет) : ;; *) mtu_restore ;; esac
-        elif [ "$(id -u)" -ne 0 ]; then
-            echo -e "  Верни: ${Y}sudo fixnet --mtu-restore${N}"
-        fi
-    else
-        if [ "$(id -u)" -eq 0 ]; then
-            mtu_ops_log superseded; rm -f "$ap"; nl_chown_state
-            echo -e "${Y}MTU уже изменён вручную (≠ правке fixnet) — операция снята; ручное не трогаю.${N}"
-        fi
-    fi
-}
-
-mtu_status() {
-    local ap; ap=$(nl_mtu_active_path)
-    if [ -f "$ap" ]; then
-        echo -e "${B}Активная правка MTU:${N}"
-        echo "  устройство:$(mtu_active_field device)"
-        echo "  поставлена:$(mtu_active_field ts)"
-        echo "  было:      $(mtu_active_field old_mtu)"
-        echo "  стало:     $(mtu_active_field new_mtu) (path MTU $(mtu_active_field path_mtu))"
-        echo -e "  вернуть:   ${Y}sudo fixnet --mtu-restore${N}"
-    else
-        echo "Активной правки MTU нет."
-    fi
-}
-
-mtu_apply() {
-    require_repair_deps "MTU"
-    local want="$1"
-    # guard/supersede как у DNS: не перетираем original old_mtu повторным бэкапом.
-    local ap; ap=$(nl_mtu_active_path)
-    if [ -f "$ap" ]; then
-        if [ "$(mtu_current "$(mtu_active_field device)")" = "$(mtu_active_field new_mtu)" ]; then
-            echo -e "${Y}Уже есть активная правка MTU fixnet.${N} Сначала верни: ${Y}sudo fixnet --mtu-restore${N}"; exit 0
-        else
-            mtu_ops_log superseded; rm -f "$ap"; nl_chown_state
-            echo -e "${Y}Прошлая правка MTU уже неактуальна (MTU сменился) — отметка снята.${N}"
-        fi
-    fi
-    local dev cur target extdev vpn=0
-    dev=$(detect_iface); cur=$(mtu_current "$dev")
-    [ -z "$cur" ] && { echo -e "${R}Не определил текущий MTU интерфейса ${dev} — отказ.${N}"; exit 1; }
-    if [ -n "$want" ]; then
-        case "$want" in *[!0-9]*) echo -e "${R}MTU должен быть числом.${N}"; exit 1 ;; esac
-        target="$want"
-    else
-        [ -t 1 ] || echo -e "${B}Измеряю path MTU (DF-зонд до ${PROBE_IP1} / ${PROBE_IP2})…${N}"
-        nl_spin_start "измеряю path MTU (DF-зонд)"
-        target=$(nl_path_mtu "$PROBE_IP1" "$PROBE_IP2")
-        nl_spin_stop
-        [ -z "$target" ] && { echo -e "${Y}Не удалось измерить (DF/ICMP-зонд не проходит даже на малом размере). MTU не трогаю.${N}"; exit 1; }
-    fi
-    [ "$target" -lt "$MTU_MIN" ] && { echo -e "${R}MTU ${target} < ${MTU_MIN} — ниже минимума IPv6, отказ.${N}"; exit 1; }
-    [ "$target" -gt "$MTU_MAX" ] && { echo -e "${R}MTU ${target} > ${MTU_MAX} — вне диапазона, отказ.${N}"; exit 1; }
-    [ "$target" -ge "$cur" ] && { echo -e "${G}Целевой MTU ${target} не меньше текущего ${cur} — менять нечего.${N}"; exit 0; }
-
-    extdev=$(route -n get "$PROBE_IP1" 2>/dev/null | awk '/interface:/{print $2}')
-    case "$extdev" in utun*) vpn=1 ;; esac
-    echo -e "${B}>>> Понижение MTU интерфейса «${dev}»: ${cur} → ${target}${N}"
-    echo -e "  ${D}Измерено до публичных якорей; путь до конкретного VPN-сервера может отличаться.${N}"
-    [ "$vpn" -eq 1 ] && echo -e "  ${Y}Активен full-tunnel VPN: измерен путь туннеля; смена MTU физического ${dev} может не помочь.${N}"
-    if [ -t 0 ]; then
-        printf "Продолжить? [y/N] "; read -r _a
-        case "$_a" in y|Y|да|Да) ;; *) echo "Отменено."; exit 0 ;; esac
-    else
-        echo -e "${Y}Нужно интерактивное подтверждение — отменено.${N}"; exit 0
-    fi
-
-    local svc; svc=$(nl_service_for_device "$dev")
-    mtu_write_active "${svc:-$dev}" "$dev" "$cur" "$target" "$target"
-    networksetup -setMTU "$dev" "$target"
-    local after; after=$(mtu_current "$dev")
-    if [ "$after" != "$target" ]; then
-        echo -e "${Y}Интерфейс не принял MTU ${target} (сейчас ${after}). Откатываю.${N}"
-        mtu_restore; exit 1
-    fi
-    dscacheutil -flushcache 2>/dev/null
-    if ping -D -s $((target-28)) -c1 -W1500 "$PROBE_IP1" >/dev/null 2>&1 && check_net; then
-        echo -e "${G}MTU понижен до ${target} — крупные DF-пакеты теперь проходят.${N}"
-    else
-        echo -e "${Y}MTU понижен до ${target}, но проверка не подтвердила улучшение однозначно.${N}"
-    fi
-    echo -e "  Вернуть: ${Y}sudo fixnet --mtu-restore${N}"
-    mtu_ops_log applied
-    exit 0
-}
-
-# ====================== WI-FI RESET (--wifi-reset) ======================
-# Для «залипшей сессии»: радио отличное, но связь наружу нестабильна. Передёргиваем
-# питание Wi-Fi (off/on) + перезапрос DHCP — переассоциация часто расклинивает
-# зависшую сессию/DHCP/ARP на точке. ДЕСТРУКТИВНО (рвёт все соединения), поэтому
-# дефолт подтверждения N и без --yes. Бэкап не нужен (действие самовосстановимо).
-# Tailscale/VPN не трогаем — туннели переподключатся сами.
-
-# Снимок качества: печатает "net dns rttavg loss" (net/dns=1/0; rtt/loss — пусто,
-# если не измерилось). Нужен для честного сравнения до/после.
-wr_snapshot() {
-    local net=0 dns=0 out rtt loss
-    check_net && net=1
-    check_dns && dns=1
-    out=$(ping -c5 -W2000 "$PROBE_IP1" 2>/dev/null)
-    rtt=$(echo "$out"  | awk -F'= ' '/min\/avg/{split($2,a,"/"); printf "%.0f", a[2]}')
-    loss=$(echo "$out" | awk -F',' '/packet loss/{for(i=1;i<=NF;i++) if($i ~ /packet loss/){gsub(/[^0-9.]/,"",$i); printf "%d",$i}}')
-    echo "$net $dns ${rtt:-} ${loss:-}"
-}
-
-wifi_reset() {
-    local ifc; ifc=$(detect_iface)
-    # Проверяем НЕ только «это en», а что интерфейс реально управляется как Wi-Fi.
-    if ! is_wifi "$ifc"; then
-        echo -e "${R}Интерфейс ${ifc} не управляется как Wi-Fi (кабель/USB-раздача?) — отказываюсь.${N}"
-        exit 1
-    fi
-    echo -e "${Y}Передёрну Wi-Fi (${ifc}): off → on + перезапрос адреса.${N}"
-    echo -e "  ${R}⚠ Все текущие соединения на пару секунд оборвутся${N} (звонки, загрузки, SSH; VPN переподключится сам)."
-    # Только осознанное интерактивное подтверждение, дефолт N. --yes намеренно НЕ
-    # действует: действие деструктивное и необратимо «здесь и сейчас».
-    if [ -t 0 ]; then
-        printf "Продолжить? [y/N] "; read -r _a
-        case "$_a" in y|Y|да|Да) ;; *) echo "Отменено."; exit 0 ;; esac
-    else
-        echo -e "${Y}Wi-Fi-reset требует интерактивного подтверждения — отменено.${N}"; exit 0
-    fi
-
-    local b a bnet bdns brtt bloss anet adns artt aloss
-    b=$(wr_snapshot); read -r bnet bdns brtt bloss <<< "$b"
-
-    networksetup -setairportpower "$ifc" off
-    sleep 3
-    networksetup -setairportpower "$ifc" on
-    sleep 2
-    ipconfig set "$ifc" DHCP
-    [ -t 1 ] || echo -e "${B}Жду восстановления связи (до 30 c)...${N}"
-    wait_net_spin 30 "жду восстановления связи (до 30 c)" >/dev/null 2>&1
-    # Дать каналу устаканиться: сразу после off/on RTT/маршруты/VPN ещё в переходном
-    # состоянии (видели всплеск 23→211 мс на здоровой сети). Пауза стабилизирует вердикт.
-    sleep 4
-
-    a=$(wr_snapshot); read -r anet adns artt aloss <<< "$a"
-
-    echo
-    echo -e "  до:    интернет $([ "$bnet" -eq 1 ] && echo да || echo нет), DNS $([ "$bdns" -eq 1 ] && echo да || echo нет), RTT ${brtt:-—} мс, потери ${bloss:-—}%"
-    echo -e "  после: интернет $([ "$anet" -eq 1 ] && echo да || echo нет), DNS $([ "$adns" -eq 1 ] && echo да || echo нет), RTT ${artt:-—} мс, потери ${aloss:-—}%"
-
-    # Критерии «лучше»: вернулась достижимость, ИЛИ потери упали ≥50%, ИЛИ RTT ≥30%.
-    local better=0 worse=0 fully=0
-    [ "$bnet" -eq 0 ] && [ "$anet" -eq 1 ] && better=1
-    [ "$bdns" -eq 0 ] && [ "$adns" -eq 1 ] && better=1
-    [ -n "$bloss" ] && [ -n "$aloss" ] && [ "$bloss" -ge 2 ] && [ "$aloss" -le $((bloss/2)) ] && better=1
-    [ -n "$brtt" ] && [ -n "$artt" ] && [ "$brtt" -ge 1 ] && [ $((artt*10)) -le $((brtt*7)) ] && better=1
-    [ "$bnet" -eq 1 ] && [ "$anet" -eq 0 ] && worse=1
-    [ "$anet" -eq 1 ] && [ "$adns" -eq 1 ] && { [ -z "$aloss" ] || [ "$aloss" -lt 5 ]; } && fully=1
-
-    echo
-    if [ "$worse" -eq 1 ]; then
-        echo -e "${Y}Стало хуже — связь обычно сама до-поднимается за несколько секунд.${N}"
-    elif [ "$better" -eq 1 ] && [ "$fully" -eq 1 ]; then
-        echo -e "${G}Помогло: связь восстановилась.${N}"
-    elif [ "$better" -eq 1 ]; then
-        echo -e "${Y}Стало немного лучше, но проблема полностью не ушла.${N}"
-    else
-        echo -e "${Y}Не помогло.${N} Похоже, дело не в Wi-Fi-сессии (провайдер/хотспот/VPN/маршрут)."
-    fi
-    exit 0
 }
 
 # ====================== ОСНОВНОЙ ХОД ======================
@@ -807,21 +332,10 @@ locate_break() {
     fi
 }
 
-# --- режимы DNS-ремонта (свой вывод; перехватываем до банера ремонта) ---
-ASSUME_YES=0
-for _a in "$@"; do case "$_a" in --yes|-y) ASSUME_YES=1 ;; esac; done
-case "${1:-}" in
-    --dns)                  need_root; dns_apply ;;          # dns_apply сам делает exit
-    --dns-restore)          need_root; dns_restore; exit $? ;;
-    --dns-status)           dns_status; exit 0 ;;
-    --wifi-reset|--reassoc) need_root; wifi_reset ;;        # wifi_reset сам делает exit
-    --mtu)                  need_root; mtu_apply "${2:-}" ;; # mtu_apply сам делает exit
-    --mtu-restore)          need_root; mtu_restore; exit $? ;;
-    --mtu-status)           mtu_status; exit 0 ;;
-esac
-
 IFACE=$(detect_iface)
-echo -e "${B}Сетевой uplink-интерфейс: ${IFACE}${N}\n"
+raw_snapshot   # снимок состояния «до» — в журнал, для разбора постфактум
+echo -e "${B}Сетевой uplink-интерфейс: ${IFACE}${N}"
+echo -e "${B}Журнал: ${LOG_FILE}${N}\n"
 
 diagnose "$IFACE"
 
@@ -832,11 +346,6 @@ if [ "${1:-}" = "--check" ]; then
     echo -e "${B}Режим проверки. Починка не выполнялась.${N}"
     exit 0
 fi
-
-# Self-heal: если с прошлого раза осталась забытая подмена DNS / правка MTU —
-# заметить и (под root) предложить вернуть. Безопасно без root (тогда только сообщит).
-dns_selfheal
-mtu_selfheal
 
 # РАЗВИЛКА: лечим ровно настолько, насколько нужно — не больше.
 #
@@ -879,42 +388,11 @@ if check_net; then
 
     if check_dns; then
         echo -e "${G}DNS восстановлен (перезапуск резолвера). Перезагрузка не понадобилась.${N}"
-        exit 0
-    fi
-
-    # Шаг 3 — ЭСКАЛАЦИЯ (Фаза 15.0): мягкий+жёсткий сброс не помогли, а IP-связность ЕСТЬ
-    # → предлагаем жёсткий DNS-ремонт (переиспользуем dns_apply: бэкап → 1.1.1.1/8.8.8.8 →
-    # проверка → откат при неудаче). ТОЛЬКО с подтверждением (default N), VPN-aware. Раньше
-    # кнопка тут «сдавалась» — и netinfo советовал «sudo fixnet --dns», но кнопка туда не доходила.
-    echo -e "${R}DNS всё ещё не резолвит.${N} Мягкий и жёсткий сброс резолвера не помогли."
-    NI_DDEV=$(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{print $2}'); NI_VPN=0
-    case "$NI_DDEV" in utun*) NI_VPN=1 ;; esac
-    NI_UTUN=$(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep -c '^utun')
-    echo
-    echo -e "Можно временно прописать рабочие DNS-серверы для текущего подключения:"
-    echo -e "  ${G}${DNS_REPAIR}${N}"
-    echo -e "Будет создан бэкап текущих настроек DNS. Откат: ${Y}sudo fixnet --dns-restore${N}"
-    if [ "$NI_VPN" -eq 1 ]; then
-        echo
-        echo -e "${Y}VPN сейчас активен.${N} Жёсткая смена DNS может обойти DNS VPN-клиента или сломать"
-        echo -e "  внутренние имена VPN/Tailscale. Если нужны внутренние адреса — лучше сначала"
-        echo -e "  полностью выключить VPN-клиенты или перезагрузить Mac."
-    fi
-    if [ "${NI_UTUN:-0}" -ge "${NL_UTUN_LOTS:-12}" ]; then
-        echo
-        echo -e "${Y}Очень много VPN-туннелей (${NI_UTUN}) и фантомных IPv6-маршрутов.${N}"
-        echo -e "  Если DNS/сайты продолжают отваливаться после ремонта — полностью закрой"
-        echo -e "  VPN-клиенты и перезагрузи Mac (мёртвые туннели уходят только так)."
-    fi
-    echo
-    if [ -t 0 ]; then
-        printf "Применить жёсткий ремонт DNS? [y/N] "; read -r NI_ESC
-        case "$NI_ESC" in
-            y|Y|да|Да|ДА) echo; ASSUME_YES=1 dns_apply ;;   # dns_apply сам бэкапит/проверяет/откатывает/exit
-            *) echo -e "Отменено. Когда будешь готов: ${Y}sudo fixnet --dns${N} (или перезагрузка)." ;;
-        esac
     else
-        echo -e "(неинтерактивно — жёсткий DNS-ремонт не применяю; запусти ${Y}sudo fixnet --dns${N})"
+        echo -e "${R}DNS всё ещё не резолвит.${N} Вероятные причины:"
+        echo -e "  • VPN-клиент подменил DNS-серверы и не вернул их (проверь, выключив VPN);"
+        echo -e "  • в Сеть -> DNS прописан недоступный сервер."
+        echo -e "  Если ничего не помогает — перезагрузка гарантированно сбросит DNS."
     fi
     exit 0
 fi
@@ -952,7 +430,7 @@ case "$CAUSE" in
             sleep 3
             networksetup -setairportpower "$IFACE" on
             ipconfig set "$IFACE" DHCP
-            if wait_net_spin 15; then
+            if wait_net 15; then
                 echo -e "${G}Помогло — связь вернулась.${N}\n"
                 diagnose "$IFACE"
                 exit 0
@@ -1008,7 +486,7 @@ ipconfig set "$IFACE" DHCP                # перезапрос адреса/м
 dscacheutil -flushcache 2>/dev/null       # сброс кэша DNS
 killall -HUP mDNSResponder 2>/dev/null    # перезапуск DNS-резолвера
 
-if wait_net_spin 15; then
+if wait_net 15; then
     echo -e "${G}Ступень 1 помогла. Связь восстановлена.${N}\n"
     diagnose "$IFACE"
     exit 0
@@ -1028,7 +506,7 @@ if is_wifi "$IFACE"; then
     networksetup -setairportpower "$IFACE" on
     route -n flush -inet >/dev/null 2>&1
     ipconfig set "$IFACE" DHCP
-    if wait_net_spin 20; then
+    if wait_net 20; then
         echo -e "${G}Ступень 2 помогла. Связь восстановлена.${N}\n"
         diagnose "$IFACE"
         exit 0
