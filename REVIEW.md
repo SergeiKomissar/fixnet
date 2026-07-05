@@ -272,8 +272,8 @@ netinfo — осмотр сети macOS
   netinfo --state           показать путь к данным
   netinfo --open-state      открыть папку данных в Finder
 
-Внутри окна:
-  Enter — закрыть · t — детали · a — советы · r — обновить · o — вход в сеть (если портал)
+Внутри окна (меню — человеческим языком, тех.проверки прячутся за «e — ещё»):
+  Enter — закрыть · r — обновить · a — что делать · u — почему сайт/файл не открывается · e — ещё
 
 Ничего не чинит и не меняет. Под sudo дополнительно видит скрытую сеть и сигнал.
 EOF
@@ -1648,32 +1648,44 @@ open_portal() {
 }
 
 interactive_menu() {
-    local choice opt="" wopt=""
-    [ "${CAPTIVE:-0}" -eq 1 ] && opt=" · o — вход в сеть"
-    [ "${WIFI:-0}" -eq 1 ] && wopt=" · s — Wi-Fi сети"
+    # ДВА УРОВНЯ (правка по UX — меню не должно быть жаргонной кашей для неспециалиста):
+    # по умолчанию видны только ОБЫЧНЫЕ действия человеческим языком; технические проверки
+    # (TCP/UDP, GitHub-зеркала, MTU, сервисы ИИ, тех.детали, глоссарий) прячутся за «e — ещё».
+    # Все прежние клавиши продолжают работать (обратная совместимость), меняется лишь показ.
+    # Опечатка/непонятная клавиша НЕ закрывает окно (раньше закрывала) — только Enter закрывает.
+    local choice opt="" wopt="" more=0
+    [ "${CAPTIVE:-0}" -eq 1 ] && opt=" · o — войти в сеть"
+    [ "${WIFI:-0}" -eq 1 ] && wopt=" · s — сети Wi-Fi рядом"
     while true; do
         echo
-        printf "  Enter — закрыть · r — обновить · t — детали · a — советы · ? — пояснения\n"
-        printf "  i — AI · u — почему ссылка · p — сеть TCP/UDP · g — GitHub/RAW · M — MTU%s%s: " "$wopt" "$opt"
+        printf "  Что дальше?  Enter — закрыть · r — обновить · a — что мне делать · u — почему сайт/файл не открывается%s%s\n" "$wopt" "$opt"
+        if [ "$more" -eq 1 ]; then
+            printf "  Проверки: t — тех.детали · i — сервисы ИИ · p — TCP/UDP · g — GitHub/зеркала · M — MTU · ? — что значат слова\n"
+            printf "  > "
+        else
+            printf "  (технические проверки — нажми e)  > "
+        fi
         read -r choice || break
         case "$choice" in
-            t|T) divider; render_tech ;;
+            "")  break ;;                        # только Enter закрывает
+            e|E) more=1 ;;                        # раскрыть экспертный уровень
             a|A) divider; render_advice ;;
-            s|S) divider; scan_report ;;
-            i|I) divider; AI_MODE="all"; AI_LIST=0; ai_report ;;   # по `i` — полный набор (+Gemini+Z.AI)
-            p|P) divider; probe_report ;;        # проверка TCP/UDP-выхода для VPN (Фаза 5/14.1)
-            g|G) divider; probe_mirrors ;;       # доступ к GitHub/RAW/зеркалам (Фаза 16.1)
-            m)   divider; mtu_report ;;          # path MTU (DF-зонд)  [строчная m иногда удобнее]
-            M)   divider; mtu_report ;;          # path MTU (DF-зонд, Фаза 4)
             u|U) divider; printf "  Вставь ссылку (Cmd+V) и Enter: "; read -r _u
                  _u=$(printf '%s' "${_u:-}" | tr -d '\r\n' | sed 's/^ *//; s/ *$//')
                  if [ -n "$_u" ]; then why_report "$_u"; else echo "  Ссылка не указана."; fi ;;
-            \?)  divider; render_explain ;;
-            r|R) divider; collect_all; render_human
-                 [ "${CAPTIVE:-0}" -eq 1 ] && opt=" · o — вход в сеть" || opt=""
-                 [ "${WIFI:-0}" -eq 1 ] && wopt=" · s — Wi-Fi сети" || wopt="" ;;
+            s|S) divider; scan_report ;;
             o|O) open_portal ;;
-            *)   break ;;
+            r|R) divider; collect_all; render_human
+                 [ "${CAPTIVE:-0}" -eq 1 ] && opt=" · o — войти в сеть" || opt=""
+                 [ "${WIFI:-0}" -eq 1 ] && wopt=" · s — сети Wi-Fi рядом" || wopt="" ;;
+            t|T) divider; render_tech ;;
+            i|I) divider; AI_MODE="all"; AI_LIST=0; ai_report ;;   # по `i` — полный набор (+Gemini+Z.AI)
+            p|P) divider; probe_report ;;        # проверка TCP/UDP-выхода для VPN (Фаза 5/14.1)
+            g|G) divider; probe_mirrors ;;       # доступ к GitHub/RAW/зеркалам (Фаза 16.1)
+            m|M) divider; mtu_report ;;          # path MTU (DF-зонд, Фаза 4)
+            \?)  divider; render_explain ;;
+            q|Q|exit|выход|q!) break ;;
+            *)   echo -e "  ${D}Не понял «${choice}». Enter — закрыть, e — все проверки.${N}" ;;
         esac
     done
 }
