@@ -8,9 +8,14 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN="$HOME/bin"
 
 # Запустить кнопку-сестру, если есть; иначе — соответствующий .sh из ~/bin.
+# Кнопки-специалисты живут в папке «Интернет» на столе (порядок на рабочем столе);
+# ищем и рядом с собой, и в этой папке — Помощник работает из любого места.
 run_sibling() {  # $1 = имя кнопки без расширения, $2 = .sh-фолбэк (с аргументами)
-    local cmd="$DIR/$1.command"
-    if [ -x "$cmd" ]; then "$cmd"; else shift; "$@"; fi
+    local cand
+    for cand in "$DIR/$1.command" "$DIR/Интернет/$1.command" "$HOME/Desktop/Интернет/$1.command"; do
+        [ -x "$cand" ] && { "$cand"; return; }
+    done
+    shift; "$@"
 }
 
 # Ссылка из буфера/ввода (для «файл»/«сайт», если у кнопки-сестры нет своего запроса).
@@ -51,7 +56,7 @@ while true; do
             run_sibling why "$BIN/netinfo.sh" --why "$(ask_url)" ;;
         4)  # ремонт — fixnet (нужен sudo)
             printf '\n  Запускаю ремонт сети. Может попросить пароль от Mac.\n'
-            if [ -x "$DIR/fixnet.command" ]; then "$DIR/fixnet.command"; else sudo "$BIN/fixnet.sh"; fi ;;
+            run_sibling fixnet sudo "$BIN/fixnet.sh" ;;
         ""|q|Q|exit|выход)
             printf '\n  Пока! Если что — жми эту кнопку снова.\n\n'; exit 0 ;;
         *)  printf '\n  Не понял «%s». Нажми 1, 2, 3 или 4.\n' "$ans" ;;

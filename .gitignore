@@ -9,3 +9,8 @@
 # временные файлы
 *.tmp
 *.bak
+
+# Производные от системной иконки Apple (GenericFolderIcon) — в публичный репо не кладём;
+# воспроизводятся локально: sips + make-folder-icon.py (см. CLAUDE.md).
+folder_base.png
+folder_1024.png
