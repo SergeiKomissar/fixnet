@@ -10,6 +10,8 @@
 #   - источник правды по СЛОЯМ отказа URL — why_report в netinfo; access его НЕ дублирует,
 #     а зовёт `netinfo --why-class` (машинный выход) и оркестрирует МАРШРУТЫ.
 #   - ПРИВАТНОСТЬ: в историю пишем host + url_hash (sha256, срез), а НЕ полный URL.
+#   - «read-only» с одним исключением: --get пишет ТОЛЬКО сам скачиваемый файл (это его
+#     продукт, по явной команде); систему/сеть/state не меняет, URL не сохраняет.
 set -u
 
 R=$'\033[0;31m'; G=$'\033[0;32m'; Y=$'\033[0;33m'; B=$'\033[0;34m'; C=$'\033[0;36m'; D=$'\033[2m'; N=$'\033[0m'
@@ -239,11 +241,190 @@ print("  отмечено: host=%s страна=%s → %s"%(last.get("host"),las
 PY
 }
 
+# ---------- Фаза 17.3: устойчивое скачивание (--get) ----------
+# Мост «слабый интернет → файл всё-таки скачался»: докачка с места обрыва (curl -C -),
+# ретраи с паузами, детектор зависания (--speed-limit/--speed-time), сверка размера,
+# MTU-подсказка при зависании крупного файла, зеркальные CDN для raw.githubusercontent.
+# ГРАНИЦЫ: это НЕ обход блокировок — качаем ТЕМ ЖЕ маршрутом; при отказе сервера
+# (регион/вход/404) честно отказываемся ДО скачивания и советуем access --matrix.
+# Пишем ТОЛЬКО сам скачиваемый файл (продукт); URL в state не сохраняется.
+
+human_size() {
+    awk -v s="${1:-0}" 'BEGIN{
+        if (s>=1073741824) printf "%.1f ГБ", s/1073741824;
+        else if (s>=1048576) printf "%.1f МБ", s/1048576;
+        else if (s>=1024) printf "%.0f КБ", s/1024;
+        else printf "%d Б", s }'
+}
+
+# Зеркальные CDN ТОГО ЖЕ файла (не «другие источники»!): только для raw.githubusercontent —
+# jsDelivr/githack отдают тот же контент того же owner/repo/ref. Для прочих URL зеркал
+# честно нет (mirrors_for молчит). ⚠ ref-ветка мутабельна — для критичного сверять sha256.
+mirrors_for() {
+    local u="$1"
+    case "$u" in
+        https://raw.githubusercontent.com/*) : ;;
+        *) return 1 ;;
+    esac
+    local rest own repo ref pth
+    rest="${u#https://raw.githubusercontent.com/}"
+    own="${rest%%/*}";  rest="${rest#*/}"
+    repo="${rest%%/*}"; rest="${rest#*/}"
+    ref="${rest%%/*}";  pth="${rest#*/}"
+    { [ -n "$own" ] && [ -n "$repo" ] && [ -n "$ref" ] && [ -n "$pth" ] && [ "$pth" != "$ref" ]; } || return 1
+    printf '%s\n' \
+        "https://cdn.jsdelivr.net/gh/${own}/${repo}@${ref}/${pth}" \
+        "https://rawcdn.githack.com/${own}/${repo}/${ref}/${pth}"
+}
+
+# Цикл докачки. Ключевая логика слабого канала: ОБРЫВ С ПРОГРЕССОМ — это нормально
+# (сбрасываем счётчик застревания и продолжаем терпеливо), а вот 3 попытки подряд БЕЗ
+# единого нового байта — застряло по-настоящему, дальше долбить бессмысленно.
+# Детектор зависания: <512 Б/с дольше 30 с → curl сам обрывает (rc 28), мы решаем, что дальше.
+# Результаты в глобалах: DL_RC (код последнего curl), DL_BREAKS (обрывов с прогрессом).
+DL_RC=1; DL_BREAKS=0
+dl_loop() {
+    local url="$1" out="$2"
+    local rc=1 stuck=0 total=0 before after delay
+    DL_BREAKS=0
+    while :; do
+        before=0; [ -f "$out" ] && before=$(stat -f%z "$out" 2>/dev/null || echo 0)
+        curl -L --fail -# -C - --connect-timeout 8 --speed-limit 512 --speed-time 30 -o "$out" "$url"
+        rc=$?
+        [ "$rc" -eq 0 ] && break
+        if [ "$rc" -eq 33 ]; then
+            # сервер не умеет Range: докачка невозможна — одна честная попытка с нуля
+            echo -e "  ${Y}Сервер не поддерживает докачку — качаю файл заново (целиком, одна попытка).${N}"
+            rm -f "$out"
+            curl -L --fail -# --connect-timeout 8 --speed-limit 512 --speed-time 30 -o "$out" "$url"
+            rc=$?; break
+        fi
+        after=0; [ -f "$out" ] && after=$(stat -f%z "$out" 2>/dev/null || echo 0)
+        if [ "$after" -gt "$before" ]; then
+            stuck=0; DL_BREAKS=$((DL_BREAKS+1))
+            echo -e "  ${D}обрыв (curl ${rc}), но докачано +$(human_size $((after-before))) — продолжаю с $(human_size "$after")${N}"
+        else
+            stuck=$((stuck+1))
+            echo -e "  ${D}попытка не продвинулась ни на байт (curl ${rc}) — ${stuck}/3${N}"
+        fi
+        total=$((total+1))
+        [ "$stuck" -ge 3 ] && break
+        [ "$total" -ge 15 ] && break   # общий предохранитель от вечного цикла
+        delay=$((stuck*5+2)); sleep "$delay"
+    done
+    DL_RC=$rc
+    [ "$rc" -eq 0 ]
+}
+
+get_file() {
+    local url="$1" out="${2:-}"
+    case "$url" in http://*|https://*) : ;; *)
+        echo -e "${Y}Нужен полный URL со схемой: access --get https://…/file.pdf [куда_сохранить]${N}"; return 2 ;; esac
+    command -v curl >/dev/null 2>&1 || { echo -e "${R}curl не найден.${N}"; return 1; }
+    local fname; fname=$(printf '%s' "$url" | sed -E 's#\?.*$##; s#/+$##; s#.*/##')
+    [ -n "$fname" ] || fname="index.html"
+    [ -n "$out" ] || out="$HOME/Downloads/$fname"
+    echo
+    echo -e "${B}=== ACCESS GET — устойчивое скачивание ===${N}"
+    echo -e "  Ресурс:     ${C}${url}${N}"
+    echo -e "  Сохраняю в: ${C}${out}${N}"
+
+    # 1) Слой отказа ДО скачивания (источник правды — why_report через --why-class):
+    #    если сервер ОТКАЗЫВАЕТ, ретраи бессмысленны — честно объясняем и не качаем.
+    local NI cls="" code="" res
+    if NI=$(netinfo_bin); then
+        res=$(NL_NO_SPINNER=1 "$NI" --why-class "$url" 2>/dev/null | head -1)
+        cls=$(printf '%s' "$res"|cut -f1); code=$(printf '%s' "$res"|cut -f2)
+        [ -n "$cls" ] && echo -e "  Слой:       ${C}${cls}${N} ${D}· HTTP ${code:-?}${N}"
+        case "$cls" in
+            dns_problem)
+                echo -e "  ${Y}Имя сайта не резолвится — качать нечего.${N} ${D}Проверь адрес; если это сеть: netinfo, sudo fixnet --dns.${N}"; return 1 ;;
+            tcp_blocked|tls_blocked)
+                echo -e "  ${Y}До сервера не достучаться на сетевом уровне — скачивание не начнётся.${N}"
+                echo -e "  ${D}Смени сеть/VPN-сервер и повтори. Карта маршрутов: access --matrix URL.${N}"; return 1 ;;
+            http_forbidden|blockpage)
+                echo -e "  ${Y}Сервер отказывает (регион/политика/защита) — ретраи не помогут.${N}"
+                echo -e "  ${D}Смени страну/сервер VPN и повтори; карта: access --matrix URL.${N}"; return 1 ;;
+            auth_required)
+                echo -e "  ${Y}Ресурс требует вход/ключ — без cookies скачивание не пройдёт. Скачай из браузера.${N}"; return 1 ;;
+            not_found)
+                echo -e "  ${Y}HTTP 404 — по этой ссылке файла нет (ссылка устарела или опечатка).${N}"; return 1 ;;
+        esac
+    fi
+
+    # 2) Ожидаемый размер (HEAD; сервер может и не сказать) + что уже скачано.
+    local explen have=0
+    explen=$(curl -sIL --connect-timeout 8 --max-time 20 "$url" 2>/dev/null \
+        | awk 'tolower($1)=="content-length:"{v=$2} END{gsub("\r","",v); print v}')
+    case "$explen" in ''|*[!0-9]*) explen="" ;; esac
+    [ -n "$explen" ] && echo -e "  Размер:     ${C}$(human_size "$explen")${N} ${D}(заявлен сервером)${N}"
+    [ -f "$out" ] && have=$(stat -f%z "$out" 2>/dev/null || echo 0)
+    if [ "$have" -gt 0 ]; then
+        if [ -n "$explen" ] && [ "$have" -ge "$explen" ]; then
+            echo -e "  ${G}Файл уже скачан полностью ($(human_size "$have")) — качать нечего.${N}"
+            echo -e "  ${D}sha256: $(shasum -a 256 "$out" 2>/dev/null | cut -c1-16)…${N}"; echo; return 0
+        fi
+        echo -e "  ${C}Найден недокачанный кусок ($(human_size "$have")) — продолжаю с места обрыва.${N}"
+    fi
+
+    # 3) Скачивание с докачкой и ретраями.
+    dl_loop "$url" "$out"
+    local rc=$DL_RC breaks=$DL_BREAKS
+
+    # 3а) Ни одного байта с основного адреса + у файла есть зеркальные CDN → пробуем их.
+    #     (Частично скачанное НЕ смешиваем с зеркалом: докачиваем только с того же хоста.)
+    local mused=""
+    if [ "$rc" -ne 0 ]; then
+        local nowhave=0; [ -f "$out" ] && nowhave=$(stat -f%z "$out" 2>/dev/null || echo 0)
+        if [ "$nowhave" -eq 0 ]; then
+            local m
+            for m in $(mirrors_for "$url" 2>/dev/null); do
+                echo -e "  ${C}Пробую зеркальный CDN того же файла:${N} ${D}${m}${N}"
+                if dl_loop "$m" "$out"; then rc=0; mused="$m"; breaks=$((breaks+DL_BREAKS)); break; fi
+            done
+        fi
+    fi
+
+    echo
+    if [ "$rc" -eq 0 ]; then
+        local fin; fin=$(stat -f%z "$out" 2>/dev/null || echo 0)
+        echo -e "  ${G}Готово:${N} ${C}${out}${N} ${D}($(human_size "$fin"))${N}"
+        if [ -n "$explen" ] && [ "$fin" -lt "$explen" ] && [ -z "$mused" ]; then
+            echo -e "  ${Y}⚠ Размер меньше заявленного ($(human_size "$fin") из $(human_size "$explen")) — файл может быть неполным.${N}"
+        fi
+        [ "$breaks" -gt 0 ] && echo -e "  ${D}Канал рвался ${breaks} раз — файл собран докачкой (без неё каждый обрыв = скачивание с нуля).${N}"
+        if [ -n "$mused" ]; then
+            local mhost; mhost=$(printf '%s' "$mused" | sed -E 's#^[a-z]+://##; s#/.*$##')
+            echo -e "  ${D}Источник — зеркальный CDN (${mhost}): тот же файл того же owner/repo/ref; для критичного сверь sha256 с оригиналом.${N}"
+        fi
+        echo -e "  ${D}sha256: $(shasum -a 256 "$out" 2>/dev/null | cut -c1-16)… (для сверки целостности)${N}"
+    else
+        local part=0; [ -f "$out" ] && part=$(stat -f%z "$out" 2>/dev/null || echo 0)
+        echo -e "  ${R}Скачать полностью не удалось.${N}"
+        [ "$part" -gt 0 ] && echo -e "  ${D}Частично скачано $(human_size "$part")${explen:+ из $(human_size "$explen")} — кусок СОХРАНЁН: повтори ту же команду позже, докачает отсюда.${N}"
+        case "$rc" in
+            28)
+                echo -e "  ${Y}Похоже на зависание канала: данные не шли дольше 30 секунд.${N}"
+                echo -e "  ${D}Если сайты при этом открываются, а КРУПНЫЕ файлы виснут — частый признак MTU-проблемы:${N}"
+                echo -e "  ${D}проверь ${C}netinfo --mtu${N}${D}, чинится ${C}sudo fixnet --mtu${N}${D} (с бэкапом и откатом).${N}" ;;
+            22)
+                echo -e "  ${Y}Сервер ответил HTTP-ошибкой уже в процессе скачивания.${N}"
+                echo -e "  ${D}Слой и маршрут: netinfo --why URL · access --matrix URL (может помочь другая страна VPN).${N}" ;;
+            6|7)
+                echo -e "  ${Y}Сеть/DNS до сервера не проходит.${N} ${D}Диагноз: netinfo · починка: кнопка fixnet.${N}" ;;
+            *)
+                echo -e "  ${D}Код curl: ${rc}. Разбор слоя: netinfo --why URL.${N}" ;;
+        esac
+    fi
+    echo
+}
+
 case "${1:-}" in
     --vpn-inventory) vpn_inventory ;;
     --matrix)        if [ "$#" -ge 2 ]; then matrix "$2"; else echo "Использование: access --matrix https://URL"; fi ;;
     --history)       history "${2:-}" ;;
     --mark)          if [ "$#" -ge 2 ]; then mark "$2"; else echo "Использование: access --mark ${MARKS// /|}"; fi ;;
+    --get)           if [ "$#" -ge 2 ]; then get_file "$2" "${3:-}"; else echo "Использование: access --get https://…/file.pdf [куда_сохранить]"; fi ;;
     ""|-h|--help)
         echo "access — выбор рабочего доверенного маршрута (слой поверх netinfo/why), read-only."
         echo "  access --vpn-inventory          чем можно управлять из shell, что лишь диагностировать"
@@ -251,6 +432,8 @@ case "${1:-}" in
         echo "  access --history [HOST]          показать накопленную карту (без нового прогона)"
         echo "  access --mark <метка>            отметить РЕАЛЬНЫЙ исход последней проверки"
         echo "                                   метки: ${MARKS// /, }"
+        echo "  access --get https://URL [файл]  устойчиво скачать: докачка с обрыва, ретраи, зеркала,"
+        echo "                                   MTU-диагноз при зависании (слабый интернет — его стихия)"
         echo "  (Фаза 17.2 --switch — позже, только при управляемом канале: Tailscale exit-node/WireGuard)"
         ;;
     *) echo "Неизвестная команда: $1 (см. access --help)" >&2; exit 2 ;;
